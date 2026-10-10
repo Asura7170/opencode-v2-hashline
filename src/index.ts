@@ -6,6 +6,7 @@ import { Plugin } from "@opencode/plugin"
 import { type AnchorStore, createAnchorStore } from "./anchor-store"
 import { annotateAttachments, cleanupAtFile, createAtFileState } from "./atfile"
 import { registerCoreTools } from "./core-tools"
+import { registerNativeGuards } from "./native-guards"
 
 export default Plugin.define({
   id: "opencode-hashline",
@@ -35,7 +36,10 @@ export default Plugin.define({
     })
     // Sin ctx.tool (stubs parciales de otros tickets) no hay tools que registrar.
     const cleanupTools = ctx.tool ? await registerCoreTools(ctx) : undefined
+    // Guardas nativas + system prompt; toleran stubs sin hook (tests de otros tickets).
+    const cleanupGuards = ctx.tool ? await registerNativeGuards(ctx) : undefined
     return async () => {
+      await cleanupGuards?.()
       await cleanupTools?.()
       for (const store of stores.values()) {
         try {
