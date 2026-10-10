@@ -53,40 +53,46 @@ function checkInt(value: unknown, key: string): number {
   return value
 }
 
+function checkExcludes(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((v) => typeof v !== "string" || v === "")) {
+    throw new ConfigError(`"excludes" debe ser string[] no vacío: ${JSON.stringify(value)}`)
+  }
+  return [...(value as string[])]
+}
+
+function checkStoreDir(value: unknown): string {
+  if (typeof value !== "string" || value === "") {
+    throw new ConfigError(`"storeDir" debe ser string no vacío: ${JSON.stringify(value)}`)
+  }
+  return value
+}
+
+// Mapa clave → validador: una sola fuente para claves conocidas y su forma.
+const LAYER_VALIDATORS: Record<string, (value: unknown, key: string) => unknown> = {
+  maxOutputLines: checkInt,
+  maxOutputBytes: checkInt,
+  maxLineChars: checkInt,
+  maxFileBytes: checkInt,
+  maxAnchors: checkInt,
+  excludes: checkExcludes,
+  storeDir: checkStoreDir,
+}
+
 // Sanitiza una capa (global, proyecto u opciones): desconocidas e inválidas rechazan.
 export function sanitizeLayer(input: unknown, where: string): Partial<HashlineConfig> {
   if (input === undefined || input === null) return {}
   if (typeof input !== "object" || Array.isArray(input)) {
     throw new ConfigError(`capa ${where} debe ser objeto: ${JSON.stringify(input)}`)
   }
-  const out: Partial<HashlineConfig> = {}
+  const out: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-    if (!KNOWN_KEYS.has(key)) {
+    const validate = LAYER_VALIDATORS[key]
+    if (!KNOWN_KEYS.has(key) || !validate) {
       throw new ConfigError(`clave desconocida "${key}" en ${where} (se rechaza)`)
     }
-    switch (key) {
-      case "maxOutputLines":
-      case "maxOutputBytes":
-      case "maxLineChars":
-      case "maxFileBytes":
-      case "maxAnchors":
-        ;(out as any)[key] = checkInt(value, key)
-        break
-      case "excludes":
-        if (!Array.isArray(value) || value.some((v) => typeof v !== "string" || v === "")) {
-          throw new ConfigError(`"excludes" debe ser string[] no vacío: ${JSON.stringify(value)}`)
-        }
-        out.excludes = [...(value as string[])]
-        break
-      case "storeDir":
-        if (typeof value !== "string" || value === "") {
-          throw new ConfigError(`"storeDir" debe ser string no vacío: ${JSON.stringify(value)}`)
-        }
-        out.storeDir = value
-        break
-    }
+    out[key] = validate(value, key)
   }
-  return out
+  return out as Partial<HashlineConfig>
 }
 
 // Precedencia: cada capa gana a la anterior; sin capas → defaults del spec.

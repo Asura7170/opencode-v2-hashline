@@ -288,6 +288,59 @@ describe("t7 batch: fallos aislados vs aborto", () => {
     await cleanup?.()
   })
 
+  test("mismo rango dos veces en el mismo mensaje → E_BATCH_OVERLAP", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\nb\nc")
+    const { tools, cleanup } = await setup(dir)
+    const ctx = callCtx("s1", "m1")
+    const before = await anchorsOf(tools, "a.txt", ctx)
+    await tools
+      .get("replace")
+      .execute(
+        {
+          file: "a.txt",
+          startAnchor: before[0].anchor,
+          endAnchor: before[1].anchor,
+          content: "A\nB",
+        },
+        ctx,
+      )
+    // Mismos anchors originales sin re-leer: solape, no stale.
+    await expect(
+      tools
+        .get("replace")
+        .execute(
+          {
+            file: "a.txt",
+            startAnchor: before[0].anchor,
+            endAnchor: before[1].anchor,
+            content: "X\nY",
+          },
+          ctx,
+        ),
+    ).rejects.toThrow(/E_BATCH_OVERLAP/)
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("A\nB\nc")
+    await cleanup?.()
+  })
+
+  test("insert dos veces sobre el mismo anchor en el mismo mensaje → E_BATCH_OVERLAP", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\nb")
+    const { tools, cleanup } = await setup(dir)
+    const ctx = callCtx("s1", "m1")
+    const before = await anchorsOf(tools, "a.txt", ctx)
+    await tools
+      .get("insert")
+      .execute({ file: "a.txt", anchor: before[0].anchor, position: "after", content: "x" }, ctx)
+    await expect(
+      tools
+        .get("insert")
+        .execute({ file: "a.txt", anchor: before[0].anchor, position: "after", content: "y" }, ctx),
+    ).rejects.toThrow(/E_BATCH_OVERLAP/)
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\nx\nb")
+    await cleanup?.()
+  })
+
   test("fallo de commit aborta el batch con marca explícita", async () => {
     const dir = project()
     writeFileSync(join(dir, "a.txt"), "a\nb")

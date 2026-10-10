@@ -8,8 +8,15 @@ import { AnchorStoreError } from "./anchor-store"
 // shortcut: colisión con contenido legítimo `aaaa│…` se stripearía;
 // aceptable hasta que #10 lo verifique contra el binario.
 
-const ECHO_RE = /^[a-z]{4}│/gm
-const ECHO_TEST = /^[a-z]{4}│/m
+// Única fuente de la forma de anchor (`│` U+2502 casi nunca aparece en
+// contenido real al inicio de línea tras 4 minúsculas). Se comparte con
+// atfile.ts; cada uso construye su RegExp fresca (sin `lastIndex` global
+// compartido y frágil).
+export const ANCHOR_SHAPE_SOURCE = "^[a-z]{4}│"
+
+function echoRe(flags: "m" | "gm"): RegExp {
+  return new RegExp(ANCHOR_SHAPE_SOURCE, flags)
+}
 
 export const SYSTEM_PROMPT_MARKER = "hashline anchors:"
 
@@ -26,7 +33,7 @@ const OWN_TOOLS = new Set(["read", "replace", "insert", "undo_last_change"])
 
 export function stripEchoedAnchors(text: string): { text: string; stripped: number } {
   let stripped = 0
-  const out = text.replace(ECHO_RE, () => {
+  const out = text.replace(echoRe("gm"), () => {
     stripped++
     return ""
   })
@@ -34,68 +41,79 @@ export function stripEchoedAnchors(text: string): { text: string; stripped: numb
 }
 
 function countEchoes(text: string): number {
-  ECHO_RE.lastIndex = 0
+  const re = echoRe("gm")
   let n = 0
-  while (ECHO_RE.exec(text) !== null) n++
+  while (re.exec(text) !== null) n++
   return n
+}
+
+// Único recorrido recursivo del input (JSON-ish): cada string pasa por el
+// visitor con setter para mutar in-place. strip/has/count lo reutilizan en
+// vez de triplicar la recursión.
+function eachString(
+  input: unknown,
+  visit: (value: string, set: (next: string) => void) => void,
+): void {
+  if (typeof input === "string") {
+    visit(input, () => {})
+    return
+  }
+  if (Array.isArray(input)) {
+    for (let i = 0; i < input.length; i++) {
+      const v = input[i]
+      if (typeof v === "string") {
+        const at = i
+        visit(v, (next) => {
+          input[at] = next
+        })
+      } else if (v !== null && typeof v === "object") {
+        eachString(v, visit)
+      }
+    }
+    return
+  }
+  if (input !== null && typeof input === "object") {
+    for (const k of Object.keys(input)) {
+      const v = (input as Record<string, unknown>)[k]
+      if (typeof v === "string") {
+        visit(v, (next) => {
+          ;(input as Record<string, unknown>)[k] = next
+        })
+      } else if (v !== null && typeof v === "object") {
+        eachString(v, visit)
+      }
+    }
+  }
 }
 
 // Recorre el input (JSON-ish) mutando strings in-place; devuelve ecos.
 export function stripEchoesInInput(input: unknown): number {
-  if (Array.isArray(input)) {
-    let n = 0
-    for (let i = 0; i < input.length; i++) {
-      const v = input[i]
-      if (typeof v === "string") {
-        const r = stripEchoedAnchors(v)
-        if (r.stripped > 0) {
-          input[i] = r.text
-          n += r.stripped
-        }
-      } else if (v !== null && typeof v === "object") {
-        n += stripEchoesInInput(v)
-      }
+  let n = 0
+  eachString(input, (v, set) => {
+    if (typeof v !== "string") return
+    const r = stripEchoedAnchors(v)
+    if (r.stripped > 0) {
+      set(r.text)
+      n += r.stripped
     }
-    return n
-  }
-  if (input !== null && typeof input === "object") {
-    let n = 0
-    for (const k of Object.keys(input)) {
-      const v = (input as Record<string, unknown>)[k]
-      if (typeof v === "string") {
-        const r = stripEchoedAnchors(v)
-        if (r.stripped > 0) {
-          ;(input as Record<string, unknown>)[k] = r.text
-          n += r.stripped
-        }
-      } else if (v !== null && typeof v === "object") {
-        n += stripEchoesInInput(v)
-      }
-    }
-    return n
-  }
-  return 0
+  })
+  return n
 }
 
 export function hasEchoesInInput(input: unknown): boolean {
-  if (typeof input === "string") {
-    ECHO_TEST.lastIndex = 0
-    return ECHO_TEST.test(input)
-  }
-  if (Array.isArray(input)) return input.some(hasEchoesInInput)
-  if (input !== null && typeof input === "object") {
-    return Object.values(input).some(hasEchoesInInput)
-  }
-  return false
+  let found = false
+  eachString(input, (v) => {
+    if (!found && typeof v === "string" && echoRe("m").test(v)) found = true
+  })
+  return found
 }
 
 function countEchoesInInput(input: unknown): number {
-  if (typeof input === "string") return countEchoes(input)
-  if (Array.isArray(input)) return input.reduce<number>((n, v) => n + countEchoesInInput(v), 0)
-  if (input !== null && typeof input === "object") {
-    return Object.values(input).reduce<number>((n, v) => n + countEchoesInInput(v), 0)
-  }
-  return 0
+  let n = 0
+  eachString(input, (v) => {
+    if (typeof v === "string") n += countEchoes(v)
+  })
+  return n
 }
 
 export async function registerNativeGuards(ctx: any): Promise<() => void> {
@@ -127,6 +145,8 @@ export async function registerNativeGuards(ctx: any): Promise<() => void> {
       }),
     )
     disposers.push(
+      // Post-edit solo avisa strips propios: no anota lecturas (el override
+      // de `read` ya sirve anchors; #6).
       await ctx.tool.hook("execute.after", (ev: any) => {
         try {
           const n = typeof ev?.id === "string" ? pending.get(ev.id) : undefined

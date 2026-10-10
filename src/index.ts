@@ -21,20 +21,13 @@ function projectDirOf(ctx: any): string | null {
 }
 
 function openStore(projectDir: string | null, sessionID: string, cfg: HashlineConfig): AnchorStore {
-  if (projectDir === null) {
-    // Sin proyecto (ctx parcial en tests): tmpdir como antes, con límites de la config.
-    const safe = sessionID.replace(/[^A-Za-z0-9._-]+/g, "_")
-    return createAnchorStore({
-      sessionId: sessionID,
-      storePath: join(tmpdir(), `opencode-hashline-${safe}.sqlite`),
-      maxFileBytes: cfg.maxFileBytes,
-      maxAnchors: cfg.maxAnchors,
-      excludes: cfg.excludes,
-    })
-  }
   // Sidecar canónico keyeado por proyecto+sesión, compartido por admisión y tools.
-  const storePath = storePathFor(projectDir, sessionID, cfg.storeDir)
-  mkdirSync(dirname(storePath), { recursive: true })
+  // Sin proyecto (ctx parcial en tests): tmpdir como antes.
+  const storePath =
+    projectDir === null
+      ? join(tmpdir(), `opencode-hashline-${sessionID.replace(/[^A-Za-z0-9._-]+/g, "_")}.sqlite`)
+      : storePathFor(projectDir, sessionID, cfg.storeDir)
+  if (projectDir !== null) mkdirSync(dirname(storePath), { recursive: true })
   return createAnchorStore({
     sessionId: sessionID,
     storePath,
@@ -65,11 +58,21 @@ export default Plugin.define({
     await ctx.session.hook("prompt", async (input) => {
       try {
         const store = storeFor(input.sessionID)
-        await annotateAttachments(
+        const skipped = await annotateAttachments(
           input.prompt.files as { uri: string }[] | undefined,
           projectDir ? withProjectKeys(store, projectDir) : store,
           atfile,
         )
+        // Admisión explícita sin romperla: los omitidos por guarda viajan
+        // como nota visible en el prompt (el host admite igual el adjunto
+        // original). Sin duplicar en re-ejecuciones del hook.
+        if (skipped.length > 0 && typeof input.prompt?.text === "string") {
+          const marker = "H_ATFILE_SKIPPED"
+          if (!input.prompt.text.includes(marker)) {
+            const detail = skipped.map((s) => `${s.code}: ${s.uri}`).join("; ")
+            input.prompt.text += `\n${marker}: ${skipped.length} attachment(s) admitted without anchors (${detail}).`
+          }
+        }
       } catch {
         // La admisión nunca se rompe por anotar.
       }

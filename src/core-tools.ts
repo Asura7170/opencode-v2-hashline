@@ -24,10 +24,6 @@ export const MAX_OUTPUT_BYTES = DEFAULT_CONFIG.maxOutputBytes
 export const MAX_LINE_CHARS = DEFAULT_CONFIG.maxLineChars
 const MAX_FILE_BYTES = DEFAULT_CONFIG.maxFileBytes
 
-export function storePathFor(projectDir: string, sessionID: string): string {
-  return configStorePathFor(projectDir, sessionID)
-}
-
 function splitLines(content: string): string[] {
   return content.replace(/\r\n/g, "\n").split("\n")
 }
@@ -297,6 +293,9 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     const disk = await tracked(batch, rel, () => readDisk(abs, rel))
     const store = storeFor(context.sessionID)
     const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk).rows)
+    // Pre-commit: los mismos anchors originales reintentados son solape,
+    // no stale (el resolve posterior fallaría con E_ANCHOR_STALE).
+    assertDisjoint(batch, rel, [startAnchor, endAnchor ?? startAnchor], `rango ${startAnchor}-${endAnchor ?? startAnchor}`)
     let range
     try {
       range = store.resolveRange(rel, startAnchor, endAnchor ?? startAnchor)
@@ -304,10 +303,12 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
       if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
       throw err
     }
+    // Post-resolve: el solape vía re-lectura usa anchors nuevos del batch.
+    const preAnchors = oldRows.slice(range.startLine - 1, range.endLine).map((r) => r.anchor)
     assertDisjoint(
       batch,
       rel,
-      oldRows.slice(range.startLine - 1, range.endLine).map((r) => r.anchor),
+      preAnchors,
       `rango ${startAnchor}-${endAnchor ?? startAnchor}`,
     )
     const diskLines = splitLines(disk)
@@ -338,6 +339,10 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     )
     if (batch) {
       batch.commits++
+      // Touched = rangos pre-commit (líneas originales) + filas nuevas
+      // post-commit: el reintento con anchors viejos y el solape vía
+      // re-lectura con anchors nuevos dan E_BATCH_OVERLAP.
+      for (const a of preAnchors) batch.touched.add(a)
       for (const r of committed.rows.slice(
         range.startLine - 1,
         range.startLine - 1 + newLines.length,
@@ -391,13 +396,15 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
       store.serve(rel, disk)
     })
     let resolved
+    // Pre-commit: reinsertar sobre el mismo anchor del batch es solape,
+    // no un segundo punto válido (el resolve posterior pasaría).
+    assertDisjoint(batch, rel, [anchor], `insert en "${anchor}"`)
     try {
       resolved = store.resolve(rel, anchor)
     } catch (err) {
       if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
       throw err
     }
-    assertDisjoint(batch, rel, [anchor], `insert en "${anchor}"`)
     const diskLines = splitLines(disk)
     const newLines = splitLines(content)
     const idx = position === "before" ? resolved.line - 1 : resolved.line
@@ -415,6 +422,9 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     )
     if (batch) {
       batch.commits++
+      // Punto pre-commit + filas nuevas: repetir el anchor o tocar lo
+      // creado da E_BATCH_OVERLAP.
+      batch.touched.add(anchor)
       for (const r of committed.rows.slice(idx, idx + newLines.length)) batch.touched.add(r.anchor)
     }
     const added = committed.rows

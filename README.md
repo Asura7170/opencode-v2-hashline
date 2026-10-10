@@ -61,7 +61,8 @@ relative is resolved against the **project** directory.
 - `@file` outside the project is annotated (anchors visible as context) but
   **not editable**: hashline tools reject out-of-project paths with
   `E_PATH_EXCLUDED`. Binary/image/excluded attachments are admitted
-  unannotated, never breaking admission.
+  unannotated with a visible `H_ATFILE_SKIPPED` note (explicit code per
+  file), never breaking admission.
 - Echo-strip is shape-based (`^[a-z]{4}│` per line): a legitimate content line
   starting with 4 lowercase letters + `│` sent through native `edit` would be
   stripped (always with an `H_ECHO_STRIPPED` notice). Native `write` never

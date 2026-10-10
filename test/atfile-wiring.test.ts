@@ -47,6 +47,28 @@ describe("setup atfile wiring", () => {
     await expect(readFile(temp, "utf-8")).rejects.toThrow()
   })
 
+  test("omitido por guarda: nota visible sin romper admisión ni duplicar", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t8-wire-"))
+    const good = join(dir, "ok.ts")
+    writeFileSync(good, "a\nb")
+    const bad = join(dir, "bin.dat")
+    writeFileSync(bad, "ab\0cd")
+    const { ctx, hooks } = stubCtx()
+    const cleanup = (await plugin.setup(ctx)) as (() => Promise<void>) | void
+    const prompt = { text: "mira esto", files: [{ uri: good }, { uri: bad }] }
+    await hooks.get("prompt")!({ sessionID: "sess1", prompt } as any)
+    // El bueno se anota, el binario se admite tal cual.
+    expect((prompt.files as any[])[0].uri).not.toBe(good)
+    expect((prompt.files as any[])[1].uri).toBe(bad)
+    expect(prompt.text).toMatch(/H_ATFILE_SKIPPED/)
+    expect(prompt.text).toMatch(/E_FILE_BINARY/)
+    // Re-ejecución: sin nota duplicada.
+    const once = prompt.text
+    await hooks.get("prompt")!({ sessionID: "sess1", prompt } as any)
+    expect(prompt.text).toBe(once)
+    await cleanup!()
+  })
+
   test("el hook nunca rompe la admisión aunque todo falle", async () => {
     const { ctx, hooks } = stubCtx()
     const cleanup = (await plugin.setup(ctx)) as (() => Promise<void>) | void

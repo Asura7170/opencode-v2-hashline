@@ -101,9 +101,33 @@ describe("admisión @file", () => {
       { uri: writeFixture(dir, "big.ts", "x".repeat(1_048_577)) },
     ]
     const before = files.map((f) => f.uri)
-    await annotateAttachments(files, store, state)
+    const skipped = await annotateAttachments(files, store, state)
     expect(files.map((f) => f.uri)).toEqual(before)
     expect(state.temps.size).toBe(0)
+    // Explícito, no silencioso: cada omitido reporta su código de guarda.
+    expect(skipped.map((s) => s.code)).toEqual([
+      "E_PATH_EXCLUDED",
+      "E_FILE_BINARY",
+      "E_FILE_BINARY",
+      "E_FILE_OVERSIZE",
+    ])
+    expect(skipped.map((s) => s.uri)).toEqual(before)
+    store.close()
+    await cleanupAtFile(state)
+  })
+
+  test("omitidos explícitos no incluyen reintentos ni ya-anotados", async () => {
+    const dir = fixtureDir()
+    const src = writeFixture(dir, "a.ts", "one\ntwo")
+    const store = memStore()
+    const state = createAtFileState()
+    const files = [{ uri: src }]
+    const first = await annotateAttachments(files, store, state)
+    expect(first).toEqual([])
+    // Segunda pasada retry-safe: sin ruido nuevo.
+    expect(await annotateAttachments(files, store, state)).toEqual([])
+    const annotated = [{ uri: writeFixture(dir, "b.ts", "abcd│one") }]
+    expect(await annotateAttachments(annotated, store, state)).toEqual([])
     store.close()
     await cleanupAtFile(state)
   })
