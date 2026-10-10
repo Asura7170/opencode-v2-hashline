@@ -1,0 +1,182 @@
+import { readFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { isAbsolute, join, relative, resolve, sep } from "node:path"
+
+import { DEFAULT_EXCLUDES, type AnchorStore } from "./anchor-store"
+
+// Config sin UI (ticket #9, historia 16 del spec):
+// archivo global < archivo de proyecto < opciones del plugin (ctx.options),
+// cableada a límites y conducta. Claves desconocidas se rechazan.
+export interface HashlineConfig {
+  maxOutputLines: number
+  maxOutputBytes: number
+  maxLineChars: number
+  maxFileBytes: number
+  maxAnchors: number
+  excludes: string[]
+  /** Override del directorio sidecar; por defecto <proyecto>/.opencode/hashline. */
+  storeDir?: string
+}
+
+export const DEFAULT_CONFIG: HashlineConfig = {
+  maxOutputLines: 2000,
+  maxOutputBytes: 50 * 1024,
+  maxLineChars: 2000,
+  maxFileBytes: 1_048_576,
+  // shortcut: default sin calibrar contra hardware real; tunable aquí.
+  maxAnchors: 4096,
+  excludes: [...DEFAULT_EXCLUDES],
+}
+
+const KNOWN_KEYS = new Set([
+  "maxOutputLines",
+  "maxOutputBytes",
+  "maxLineChars",
+  "maxFileBytes",
+  "maxAnchors",
+  "excludes",
+  "storeDir",
+])
+
+export class ConfigError extends Error {
+  readonly code = "E_INVALID_CONFIG"
+  constructor(message: string) {
+    super(`[E_INVALID_CONFIG] ${message}`)
+    this.name = "ConfigError"
+  }
+}
+
+function checkInt(value: unknown, key: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new ConfigError(`"${key}" debe ser entero >= 1: ${JSON.stringify(value)}`)
+  }
+  return value
+}
+
+// Sanitiza una capa (global, proyecto u opciones): desconocidas e inválidas rechazan.
+export function sanitizeLayer(input: unknown, where: string): Partial<HashlineConfig> {
+  if (input === undefined || input === null) return {}
+  if (typeof input !== "object" || Array.isArray(input)) {
+    throw new ConfigError(`capa ${where} debe ser objeto: ${JSON.stringify(input)}`)
+  }
+  const out: Partial<HashlineConfig> = {}
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (!KNOWN_KEYS.has(key)) {
+      throw new ConfigError(`clave desconocida "${key}" en ${where} (se rechaza)`)
+    }
+    switch (key) {
+      case "maxOutputLines":
+      case "maxOutputBytes":
+      case "maxLineChars":
+      case "maxFileBytes":
+      case "maxAnchors":
+        ;(out as any)[key] = checkInt(value, key)
+        break
+      case "excludes":
+        if (!Array.isArray(value) || value.some((v) => typeof v !== "string" || v === "")) {
+          throw new ConfigError(`"excludes" debe ser string[] no vacío: ${JSON.stringify(value)}`)
+        }
+        out.excludes = [...(value as string[])]
+        break
+      case "storeDir":
+        if (typeof value !== "string" || value === "") {
+          throw new ConfigError(`"storeDir" debe ser string no vacío: ${JSON.stringify(value)}`)
+        }
+        out.storeDir = value
+        break
+    }
+  }
+  return out
+}
+
+// Precedencia: cada capa gana a la anterior; sin capas → defaults del spec.
+export function resolveConfig(layers: unknown[]): HashlineConfig {
+  let merged: HashlineConfig = { ...DEFAULT_CONFIG, excludes: [...DEFAULT_CONFIG.excludes] }
+  layers.forEach((layer, i) => {
+    merged = { ...merged, ...sanitizeLayer(layer, `capa #${i}`) }
+  })
+  return merged
+}
+
+export function globalConfigPath(homeDir: string = homedir()): string {
+  return join(homeDir, ".config", "opencode", "hashline", "config.json")
+}
+
+export function projectConfigPath(projectDir: string): string {
+  return join(projectDir, ".opencode", "hashline", "config.json")
+}
+
+// Dueño canónico del sidecar (spec: <proyecto>/.opencode/hashline/<sesión>.sqlite).
+export function storePathFor(projectDir: string, sessionID: string, storeDir?: string): string {
+  const safe = sessionID.replace(/[^a-zA-Z0-9_-]/g, "_") || "session"
+  return join(storeDir ?? join(projectDir, ".opencode", "hashline"), `${safe}.sqlite`)
+}
+
+async function loadLayer(path: string, where: string): Promise<Partial<HashlineConfig>> {
+  let raw: string
+  try {
+    raw = await readFile(path, "utf-8")
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return {}
+    throw new ConfigError(`no se pudo leer ${where} (${path}): ${err?.message ?? err}`)
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new ConfigError(`JSON inválido en ${where} (${path})`)
+  }
+  return sanitizeLayer(parsed, where)
+}
+
+export interface LoadOptions {
+  projectDir?: string
+  globalPath?: string
+  projectPath?: string
+  options?: unknown
+}
+
+export async function loadHashlineConfig(load: LoadOptions = {}): Promise<HashlineConfig> {
+  const globalPath = load.globalPath ?? globalConfigPath()
+  const layers: unknown[] = [await loadLayer(globalPath, "config global")]
+  if (load.projectDir) {
+    layers.push(
+      await loadLayer(load.projectPath ?? projectConfigPath(load.projectDir), "config de proyecto"),
+    )
+  } else if (load.projectPath) {
+    layers.push(await loadLayer(load.projectPath, "config de proyecto"))
+  }
+  layers.push(sanitizeLayer(load.options, "opciones del plugin"))
+  return resolveConfig(layers)
+}
+
+// Unificación de claves (divergencia #5/#8): la admisión recibe paths absolutos
+// (uris) y los tools claves relativas al proyecto; ambos deben caer al mismo
+// served-record. Dentro del proyecto → relativa con "/" (como los tools);
+// fuera → absoluta normalizada (los tools la rechazan antes del store).
+export function relativeKeyFor(projectDir: string, fsPath: string): string | null {
+  const abs = isAbsolute(fsPath) ? fsPath : resolve(projectDir, fsPath)
+  const rel = relative(projectDir, abs)
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null
+  return rel.split(sep).join("/")
+}
+
+function keyForFile(projectDir: string, filePath: string): string {
+  return relativeKeyFor(projectDir, filePath) ?? filePath.replace(/\\/g, "/")
+}
+
+// Vista del store compartido con claves de proyecto para el hook de admisión.
+export function withProjectKeys(store: AnchorStore, projectDir: string): AnchorStore {
+  return {
+    serve: (filePath, content) => store.serve(keyForFile(projectDir, filePath), content),
+    commit: (filePath, newContent, commitOpts) =>
+      store.commit(keyForFile(projectDir, filePath), newContent, commitOpts),
+    resolve: (filePath, anchor) => store.resolve(keyForFile(projectDir, filePath), anchor),
+    resolveRange: (filePath, startAnchor, endAnchor) =>
+      store.resolveRange(keyForFile(projectDir, filePath), startAnchor, endAnchor),
+    undoShadow: (filePath) => store.undoShadow(keyForFile(projectDir, filePath)),
+    restoreShadow: (filePath, diskLines) =>
+      store.restoreShadow(keyForFile(projectDir, filePath), diskLines),
+    close: () => {},
+  }
+}

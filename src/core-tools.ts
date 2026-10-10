@@ -9,17 +9,22 @@ import {
   type AnchorStore,
 } from "./anchor-store"
 
-// Defaults inline según spec (1MiB, 2000 líneas/50KB, excludes en el store).
-// La config cableada del ticket #9 deberá gobernar estos valores;
-// shortcut: sin calibrar contra hardware real, subir/bajar aquí cuando #9 lo haga tunable.
-export const MAX_OUTPUT_LINES = 2000
-export const MAX_OUTPUT_BYTES = 50 * 1024
-export const MAX_LINE_CHARS = 2000
-const MAX_FILE_BYTES = 1_048_576
+import {
+  DEFAULT_CONFIG,
+  loadHashlineConfig,
+  storePathFor as configStorePathFor,
+  type HashlineConfig,
+} from "./config"
+
+// Defaults del spec (ticket #9): los gobierna la config
+// (global < proyecto < opciones); aquí solo quedan como re-export estable.
+export const MAX_OUTPUT_LINES = DEFAULT_CONFIG.maxOutputLines
+export const MAX_OUTPUT_BYTES = DEFAULT_CONFIG.maxOutputBytes
+export const MAX_LINE_CHARS = DEFAULT_CONFIG.maxLineChars
+const MAX_FILE_BYTES = DEFAULT_CONFIG.maxFileBytes
 
 export function storePathFor(projectDir: string, sessionID: string): string {
-  const safe = sessionID.replace(/[^a-zA-Z0-9_-]/g, "_") || "session"
-  return join(projectDir, ".opencode", "hashline", `${safe}.sqlite`)
+  return configStorePathFor(projectDir, sessionID)
 }
 
 function splitLines(content: string): string[] {
@@ -40,9 +45,9 @@ function resolveInProject(projectDir: string, file: unknown): { abs: string; rel
 
 // Rechazo pre-escritura espejo del store: evita dejar disco y store divergentes
 // si el commit fallara por guards (el store valida path/size/binario al ingerir).
-function checkNewContent(rel: string, newContent: string): void {
-  if (Buffer.byteLength(newContent, "utf-8") > MAX_FILE_BYTES) {
-    throw new AnchorStoreError("E_FILE_OVERSIZE", `Archivo excede ${MAX_FILE_BYTES} bytes: "${rel}"`)
+function checkNewContent(rel: string, newContent: string, maxFileBytes: number): void {
+  if (Buffer.byteLength(newContent, "utf-8") > maxFileBytes) {
+    throw new AnchorStoreError("E_FILE_OVERSIZE", `Archivo excede ${maxFileBytes} bytes: "${rel}"`)
   }
   if (newContent.includes("\0")) {
     throw new AnchorStoreError("E_FILE_BINARY", `Binario (NUL) rechazado: "${rel}"`)
@@ -58,9 +63,9 @@ interface BatchState {
   aborted: string | null
 }
 
-function formatRow(row: AnchorRow): string {
-  if (row.content.length > MAX_LINE_CHARS) {
-    return `${row.anchor}│${row.content.slice(0, MAX_LINE_CHARS)} ⟨+${row.content.length - MAX_LINE_CHARS} chars⟩`
+function formatRow(row: AnchorRow, maxLineChars: number): string {
+  if (row.content.length > maxLineChars) {
+    return `${row.anchor}│${row.content.slice(0, maxLineChars)} ⟨+${row.content.length - maxLineChars} chars⟩`
   }
   return `${row.anchor}│${row.content}`
 }
@@ -80,15 +85,16 @@ function renderPage(
   startLine: number,
   limit: number,
   warnings: { code: string; message: string }[],
+  cfg: HashlineConfig,
 ): Page {
   const window = rows.slice(startLine - 1, startLine - 1 + limit)
   const lines: string[] = []
   let bytes = 0
   let shown = 0
   for (const row of window) {
-    const text = formatRow(row)
+    const text = formatRow(row, cfg.maxLineChars)
     const size = Buffer.byteLength(text + "\n", "utf-8")
-    if (bytes + size > MAX_OUTPUT_BYTES && shown > 0) break
+    if (bytes + size > cfg.maxOutputBytes && shown > 0) break
     lines.push(text)
     bytes += size
     shown++
@@ -137,12 +143,12 @@ function parseOffset(offset: unknown, resolveAnchor: (anchor: string) => number)
   throw new AnchorStoreError("E_INVALID_INPUT", `offset inválido: ${JSON.stringify(offset)}`)
 }
 
-function parseLimit(limit: unknown): number {
-  if (limit === undefined) return MAX_OUTPUT_LINES
+function parseLimit(limit: unknown, maxOutputLines: number): number {
+  if (limit === undefined) return maxOutputLines
   if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
     throw new AnchorStoreError("E_INVALID_INPUT", `limit inválido: ${JSON.stringify(limit)}`)
   }
-  return Math.min(limit, MAX_OUTPUT_LINES)
+  return Math.min(limit, maxOutputLines)
 }
 
 async function readDisk(abs: string, rel: string): Promise<string> {
@@ -159,8 +165,16 @@ async function readDisk(abs: string, rel: string): Promise<string> {
   }
 }
 
-export async function registerCoreTools(ctx: any): Promise<() => void> {
+export interface CoreToolsDeps {
+  /** Config ya resuelta por el entry (precedencia global < proyecto < opciones). */
+  config?: HashlineConfig
+  /** Store compartido por sesión (unificación admisión/tools del ticket #9). */
+  storeFor?: (sessionID: string) => AnchorStore
+}
+
+export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise<() => void> {
   const projectDir: string = ctx.location.project.directory
+  const cfg = deps?.config ?? (await loadHashlineConfig({ projectDir, options: ctx.options }))
   const stores = new Map<string, AnchorStore>()
   const batches = new Map<string, BatchState>()
 
@@ -219,15 +233,23 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     }
   }
 
-  function storeFor(sessionID: string): AnchorStore {
+  function ownStoreFor(sessionID: string): AnchorStore {
     const cached = stores.get(sessionID)
     if (cached) return cached
-    const storePath = storePathFor(projectDir, sessionID)
-    mkdirSync(join(projectDir, ".opencode", "hashline"), { recursive: true })
-    const store = createAnchorStore({ sessionId: sessionID, storePath })
+    const storePath = configStorePathFor(projectDir, sessionID, cfg.storeDir)
+    mkdirSync(join(cfg.storeDir ?? join(projectDir, ".opencode", "hashline")), { recursive: true })
+    const store = createAnchorStore({
+      sessionId: sessionID,
+      storePath,
+      maxFileBytes: cfg.maxFileBytes,
+      maxAnchors: cfg.maxAnchors,
+      excludes: cfg.excludes,
+    })
     stores.set(sessionID, store)
     return store
   }
+
+  const storeFor = deps?.storeFor ?? ownStoreFor
 
   async function readExecute(input: any, context: any) {
     const { abs, rel } = resolveInProject(projectDir, input?.file)
@@ -235,8 +257,8 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     const store = storeFor(context.sessionID)
     const served = store.serve(rel, disk)
     const startLine = parseOffset(input?.offset, (anchor) => store.resolve(rel, anchor).line)
-    const limit = parseLimit(input?.limit)
-    const page = renderPage(served.rows, startLine, limit, served.warnings)
+    const limit = parseLimit(input?.limit, cfg.maxOutputLines)
+    const page = renderPage(served.rows, startLine, limit, served.warnings, cfg)
     return { content: page.text, metadata: page.metadata }
   }
 
@@ -279,7 +301,7 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
       ...diskLines.slice(range.endLine),
     ].join("\n")
     await tracked(batch, rel, async () => {
-      checkNewContent(rel, newContent)
+      checkNewContent(rel, newContent, cfg.maxFileBytes)
     })
     await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
     const committed = await tracked(batch, rel, () =>
@@ -299,10 +321,10 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
         batch.touched.add(r.anchor)
       }
     }
-    const removed = oldRows.slice(range.startLine - 1, range.endLine).map((r) => `- ${formatRow(r)}`)
+    const removed = oldRows.slice(range.startLine - 1, range.endLine).map((r) => `- ${formatRow(r, cfg.maxLineChars)}`)
     const added = committed.rows
       .slice(range.startLine - 1, range.startLine - 1 + newLines.length)
-      .map((r) => `+ ${formatRow(r)}`)
+      .map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`)
     const lines = [
       `replace ${rel} lines ${range.startLine}-${range.endLine} (anchors ${startAnchor}-${endAnchor ?? startAnchor}):`,
       ...removed,
@@ -351,7 +373,7 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     const idx = position === "before" ? resolved.line - 1 : resolved.line
     const newContent = [...diskLines.slice(0, idx), ...newLines, ...diskLines.slice(idx)].join("\n")
     await tracked(batch, rel, async () => {
-      checkNewContent(rel, newContent)
+      checkNewContent(rel, newContent, cfg.maxFileBytes)
     })
     await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
     const committed = await tracked(batch, rel, () =>
@@ -365,7 +387,9 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
       batch.commits++
       for (const r of committed.rows.slice(idx, idx + newLines.length)) batch.touched.add(r.anchor)
     }
-    const added = committed.rows.slice(idx, idx + newLines.length).map((r) => `+ ${formatRow(r)}`)
+    const added = committed.rows
+      .slice(idx, idx + newLines.length)
+      .map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`)
     const lines = [
       `insert ${rel} ${position} anchor ${anchor} (line ${resolved.line}):`,
       ...added,
@@ -402,7 +426,7 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     }
     const lines = [
       `undo ${rel}: restored ${restored.rows.length} lines.`,
-      ...restored.rows.map((r) => `+ ${formatRow(r)}`),
+      ...restored.rows.map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`),
       `${restored.rows.length} lines total.`,
       ...formatWarnings(restored.warnings),
     ]
@@ -423,7 +447,7 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
           anyOf: [{ type: "number" }, { type: "string" }],
           description: "1-based line number or anchor to start from.",
         },
-        limit: { type: "number", description: "Max rows (default 2000)." },
+        limit: { type: "number", description: `Max rows (default ${cfg.maxOutputLines}).` },
       },
       required: ["file"],
       additionalProperties: false,
