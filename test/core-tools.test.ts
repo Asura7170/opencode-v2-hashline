@@ -193,8 +193,28 @@ describe("t5 replace por anchor", () => {
     await cleanup?.()
   })
 
-  test("noop idéntico no escribe (H_NOOP, mtime intacto)", async () => {
+  test("stale e2e: el mensaje visible al modelo incluye las filas actuales", async () => {
     const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\nb")
+    const { tools, cleanup } = await setup(dir)
+    const served = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    const err = await tools
+      .get("replace")
+      .execute({ file: "a.txt", startAnchor: "zzzz", content: "x" }, callCtx())
+      .then(
+        () => null,
+        (e: any) => e,
+      )
+    expect(err).not.toBeNull()
+    // El host solo muestra el mensaje (visto en e2e #10): las filas deben
+    // viajar en el texto, no solo en err.rows.
+    for (const r of served) {
+      expect(String(err.message ?? err)).toContain(`${r.anchor}│${r.content}`)
+    }
+    await cleanup?.()
+  })
+
+  test("noop idéntico no escribe (H_NOOP, mtime intacto)", async () => {    const dir = project()
     writeFileSync(join(dir, "a.txt"), "a\nb\nc")
     const { tools, cleanup } = await setup(dir)
     const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
@@ -306,6 +326,39 @@ describe("t5 vacías, límites y sidecar", () => {
     const { readdirSync } = await import("node:fs")
     const names = readdirSync(join(dir, ".opencode", "hashline")).sort()
     expect(names).toEqual(["sess-1.sqlite", "sess-2.sqlite"])
+    await cleanup?.()
+  })
+})
+
+describe("t10 contrato de registro con el host (e2e 2.0.26)", () => {
+  test("override de read: limpia el output declarado nativo (el host usa content)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "one")
+    const { ctx, tools } = makeCtx(dir)
+    await ctx.tool.transform((editor: any) => {
+      editor.add({
+        name: "read",
+        description: "native",
+        input: { type: "object", properties: {} },
+        output: { type: "object", properties: { text: { type: "string" } } },
+        options: { codemode: false },
+        execute: async () => ({ output: { text: "native" } }),
+      })
+    })
+    await plugin.setup(ctx)
+    // Con output declarado, el host exige devolver `output`; nuestro execute
+    // devuelve {content, metadata} → el host fallaría con
+    // "Tool did not return its declared output" (visto en e2e).
+    expect(tools.get("read").output).toBeUndefined()
+  })
+
+  test("las 4 tools quedan directas al provider (codemode false, como el read nativo)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "one")
+    const { tools, cleanup } = await setup(dir)
+    for (const name of ["read", "replace", "insert", "undo_last_change"]) {
+      expect(tools.get(name)?.options).toEqual({ codemode: false })
+    }
     await cleanup?.()
   })
 })

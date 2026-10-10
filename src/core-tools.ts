@@ -1,9 +1,10 @@
 import { mkdirSync } from "node:fs"
 import { readFile, writeFile } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve, sep } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 
 import {
   AnchorStoreError,
+  StaleAnchorError,
   createAnchorStore,
   type AnchorRow,
   type AnchorStore,
@@ -72,6 +73,17 @@ function formatRow(row: AnchorRow, maxLineChars: number): string {
 
 function formatWarnings(warnings: { code: string; message: string }[]): string[] {
   return warnings.map((w) => `${w.code}: ${w.message}`)
+}
+
+// El host solo muestra el mensaje del error al modelo (e2e #10): las filas
+// viajan en el texto para retry sin re-read. Preserva clase y rows para
+// los consumidores programáticos.
+function withCurrentRows(err: StaleAnchorError, maxLineChars: number): StaleAnchorError {
+  if (!err.rows || err.rows.length === 0) return err
+  return new StaleAnchorError(
+    `${err.message.replace(/^\[[A-Z_]{2,}\] /, "")}\nCurrent rows:\n${err.rows.map((r) => formatRow(r, maxLineChars)).join("\n")}`,
+    err.rows,
+  )
 }
 
 interface Page {
@@ -237,7 +249,7 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     const cached = stores.get(sessionID)
     if (cached) return cached
     const storePath = configStorePathFor(projectDir, sessionID, cfg.storeDir)
-    mkdirSync(join(cfg.storeDir ?? join(projectDir, ".opencode", "hashline")), { recursive: true })
+    mkdirSync(dirname(storePath), { recursive: true })
     const store = createAnchorStore({
       sessionId: sessionID,
       storePath,
@@ -256,7 +268,13 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     const disk = await readDisk(abs, rel)
     const store = storeFor(context.sessionID)
     const served = store.serve(rel, disk)
-    const startLine = parseOffset(input?.offset, (anchor) => store.resolve(rel, anchor).line)
+    let startLine: number
+    try {
+      startLine = parseOffset(input?.offset, (anchor) => store.resolve(rel, anchor).line)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
     const limit = parseLimit(input?.limit, cfg.maxOutputLines)
     const page = renderPage(served.rows, startLine, limit, served.warnings, cfg)
     return { content: page.text, metadata: page.metadata }
@@ -279,7 +297,13 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     const disk = await tracked(batch, rel, () => readDisk(abs, rel))
     const store = storeFor(context.sessionID)
     const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk).rows)
-    const range = store.resolveRange(rel, startAnchor, endAnchor ?? startAnchor)
+    let range
+    try {
+      range = store.resolveRange(rel, startAnchor, endAnchor ?? startAnchor)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
     assertDisjoint(
       batch,
       rel,
@@ -366,7 +390,13 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     await tracked(batch, rel, async () => {
       store.serve(rel, disk)
     })
-    const resolved = store.resolve(rel, anchor)
+    let resolved
+    try {
+      resolved = store.resolve(rel, anchor)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
     assertDisjoint(batch, rel, [anchor], `insert en "${anchor}"`)
     const diskLines = splitLines(disk)
     const newLines = splitLines(content)
@@ -452,6 +482,7 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
       required: ["file"],
       additionalProperties: false,
     },
+    options: { codemode: false },
     execute: readExecute,
   }
   const replaceDef = {
@@ -468,6 +499,7 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
       required: ["file", "startAnchor", "content"],
       additionalProperties: false,
     },
+    options: { codemode: false },
     execute: replaceExecute,
   }
   const insertDef = {
@@ -484,6 +516,7 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
       required: ["file", "anchor", "position", "content"],
       additionalProperties: false,
     },
+    options: { codemode: false },
     execute: insertExecute,
   }
   const undoDef = {
@@ -497,6 +530,9 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
       required: ["file"],
       additionalProperties: false,
     },
+    // Directas al provider como las nativas (codemode false): el modelo las
+    // llama por nombre, imprescindible para el batch mismo-mensaje (#7).
+    options: { codemode: false },
     execute: undoExecute,
   }
 
@@ -506,6 +542,11 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
         tool.description = readDef.description
         tool.input = readDef.input
         tool.execute = readExecute
+        // Nuestro execute devuelve {content, metadata}: sin output declarado
+        // el host sirve `content` al modelo. Con el output nativo heredado el
+        // host rechaza con "Tool did not return its declared output" (e2e #10).
+        tool.output = undefined
+        tool.options = readDef.options
       })
     } else {
       editor.add(readDef)

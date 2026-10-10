@@ -107,9 +107,15 @@ export function projectConfigPath(projectDir: string): string {
 }
 
 // Dueño canónico del sidecar (spec: <proyecto>/.opencode/hashline/<sesión>.sqlite).
+// storeDir relativo se interpreta relativo al proyecto (no al cwd del host).
 export function storePathFor(projectDir: string, sessionID: string, storeDir?: string): string {
   const safe = sessionID.replace(/[^a-zA-Z0-9_-]/g, "_") || "session"
-  return join(storeDir ?? join(projectDir, ".opencode", "hashline"), `${safe}.sqlite`)
+  const base = storeDir
+    ? isAbsolute(storeDir)
+      ? storeDir
+      : join(projectDir, storeDir)
+    : join(projectDir, ".opencode", "hashline")
+  return join(base, `${safe}.sqlite`)
 }
 
 async function loadLayer(path: string, where: string): Promise<Partial<HashlineConfig>> {

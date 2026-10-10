@@ -30,6 +30,11 @@ describe("config defaults = límites del spec", () => {
     expect(storePathFor(dir, "sess-1")).toBe(join(dir, ".opencode", "hashline", "sess-1.sqlite"))
   })
 
+  test("storeDir relativo se fija al proyecto, no al cwd (e2e #10g)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "t9-path-"))
+    expect(storePathFor(dir, "sess-1", "sidecars")).toBe(join(dir, "sidecars", "sess-1.sqlite"))
+  })
+
   test("projectConfigPath vive junto al sidecar", () => {
     const dir = mkdtempSync(join(tmpdir(), "t9-path-"))
     expect(projectConfigPath(dir)).toBe(join(dir, ".opencode", "hashline", "config.json"))
