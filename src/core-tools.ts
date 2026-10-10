@@ -49,6 +49,15 @@ function checkNewContent(rel: string, newContent: string): void {
   }
 }
 
+// Batching #7: mismo-mensaje mismo-archivo = una unidad de undo. Clave por
+// sesión+mensaje+archivo; solo vive en memoria (los batches no cruzan
+// mensajes ni restarts). Tope anti-crecimiento.
+interface BatchState {
+  touched: Set<string>
+  commits: number
+  aborted: string | null
+}
+
 function formatRow(row: AnchorRow): string {
   if (row.content.length > MAX_LINE_CHARS) {
     return `${row.anchor}│${row.content.slice(0, MAX_LINE_CHARS)} ⟨+${row.content.length - MAX_LINE_CHARS} chars⟩`
@@ -153,6 +162,62 @@ async function readDisk(abs: string, rel: string): Promise<string> {
 export async function registerCoreTools(ctx: any): Promise<() => void> {
   const projectDir: string = ctx.location.project.directory
   const stores = new Map<string, AnchorStore>()
+  const batches = new Map<string, BatchState>()
+
+  function batchFor(sessionID: unknown, messageID: unknown, rel: string): BatchState | null {
+    if (typeof sessionID !== "string" || typeof messageID !== "string") return null
+    const key = `${sessionID}\n${messageID}\n${rel}`
+    let batch = batches.get(key)
+    if (!batch) {
+      if (batches.size > 200) batches.delete(batches.keys().next().value!)
+      batch = { touched: new Set(), commits: 0, aborted: null }
+      batches.set(key, batch)
+    }
+    return batch
+  }
+
+  function assertBatchOpen(batch: BatchState | null, rel: string): void {
+    if (batch?.aborted) {
+      throw new AnchorStoreError(
+        "E_BATCH_ABORTED",
+        `Batch para "${rel}" abortado tras ${batch.aborted}; reintenta en un mensaje nuevo`,
+      )
+    }
+  }
+
+  // Fallo de archivo/commit: aborta el batch con marca explícita. Los errores
+  // de validación/resolución (stale, rango, input) NO pasan por aquí: fallan solos.
+  async function tracked<T>(batch: BatchState | null, rel: string, fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn()
+    } catch (err: any) {
+      if (batch) batch.aborted = typeof err?.code === "string" ? err.code : "E_FILE_WRITE"
+      if (err instanceof AnchorStoreError) {
+        err.message += ` (H_BATCH_ABORTED: batch para "${rel}" abortado)`
+        throw err
+      }
+      throw new AnchorStoreError(
+        "E_FILE_WRITE",
+        `No se pudo escribir "${rel}": ${err?.message ?? String(err)} (H_BATCH_ABORTED: batch para "${rel}" abortado)`,
+      )
+    }
+  }
+
+  function assertDisjoint(
+    batch: BatchState | null,
+    rel: string,
+    anchors: string[],
+    where: string,
+  ): void {
+    if (!batch) return
+    const hit = anchors.find((a) => batch.touched.has(a))
+    if (hit) {
+      throw new AnchorStoreError(
+        "E_BATCH_OVERLAP",
+        `Batch solapado en "${rel}": ${where} toca "${hit}", ya editado en este mensaje; usa rangos disjuntos o un mensaje nuevo`,
+      )
+    }
+  }
 
   function storeFor(sessionID: string): AnchorStore {
     const cached = stores.get(sessionID)
@@ -187,10 +252,18 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     if (typeof content !== "string") {
       throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro content requerido (string)")
     }
-    const disk = await readDisk(abs, rel)
+    const batch = batchFor(context?.sessionID, context?.messageID, rel)
+    assertBatchOpen(batch, rel)
+    const disk = await tracked(batch, rel, () => readDisk(abs, rel))
     const store = storeFor(context.sessionID)
-    const oldRows = store.serve(rel, disk).rows
+    const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk).rows)
     const range = store.resolveRange(rel, startAnchor, endAnchor ?? startAnchor)
+    assertDisjoint(
+      batch,
+      rel,
+      oldRows.slice(range.startLine - 1, range.endLine).map((r) => r.anchor),
+      `rango ${startAnchor}-${endAnchor ?? startAnchor}`,
+    )
     const diskLines = splitLines(disk)
     const newLines = splitLines(content)
     const oldSlice = diskLines.slice(range.startLine - 1, range.endLine)
@@ -205,9 +278,27 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
       ...newLines,
       ...diskLines.slice(range.endLine),
     ].join("\n")
-    checkNewContent(rel, newContent)
-    await writeFile(abs, newContent, "utf-8")
-    const committed = store.commit(rel, newContent)
+    await tracked(batch, rel, async () => {
+      checkNewContent(rel, newContent)
+    })
+    await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
+    const committed = await tracked(batch, rel, () =>
+      // Continuación de batch: un solo undo por mensaje (sombra del primero).
+      Promise.resolve(
+        batch && batch.commits > 0
+          ? store.commit(rel, newContent, { keepShadow: true })
+          : store.commit(rel, newContent),
+      ),
+    )
+    if (batch) {
+      batch.commits++
+      for (const r of committed.rows.slice(
+        range.startLine - 1,
+        range.startLine - 1 + newLines.length,
+      )) {
+        batch.touched.add(r.anchor)
+      }
+    }
     const removed = oldRows.slice(range.startLine - 1, range.endLine).map((r) => `- ${formatRow(r)}`)
     const added = committed.rows
       .slice(range.startLine - 1, range.startLine - 1 + newLines.length)
@@ -246,17 +337,34 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     if (typeof content !== "string") {
       throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro content requerido (string)")
     }
-    const disk = await readDisk(abs, rel)
+    const batch = batchFor(context?.sessionID, context?.messageID, rel)
+    assertBatchOpen(batch, rel)
+    const disk = await tracked(batch, rel, () => readDisk(abs, rel))
     const store = storeFor(context.sessionID)
-    store.serve(rel, disk)
+    await tracked(batch, rel, async () => {
+      store.serve(rel, disk)
+    })
     const resolved = store.resolve(rel, anchor)
+    assertDisjoint(batch, rel, [anchor], `insert en "${anchor}"`)
     const diskLines = splitLines(disk)
     const newLines = splitLines(content)
     const idx = position === "before" ? resolved.line - 1 : resolved.line
     const newContent = [...diskLines.slice(0, idx), ...newLines, ...diskLines.slice(idx)].join("\n")
-    checkNewContent(rel, newContent)
-    await writeFile(abs, newContent, "utf-8")
-    const committed = store.commit(rel, newContent)
+    await tracked(batch, rel, async () => {
+      checkNewContent(rel, newContent)
+    })
+    await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
+    const committed = await tracked(batch, rel, () =>
+      Promise.resolve(
+        batch && batch.commits > 0
+          ? store.commit(rel, newContent, { keepShadow: true })
+          : store.commit(rel, newContent),
+      ),
+    )
+    if (batch) {
+      batch.commits++
+      for (const r of committed.rows.slice(idx, idx + newLines.length)) batch.touched.add(r.anchor)
+    }
     const added = committed.rows.slice(idx, idx + newLines.length).map((r) => `+ ${formatRow(r)}`)
     const lines = [
       `insert ${rel} ${position} anchor ${anchor} (line ${resolved.line}):`,
@@ -267,6 +375,40 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     return {
       content: lines.join("\n"),
       metadata: { changed: true, file: rel, line: resolved.line, totalLines: committed.rows.length },
+    }
+  }
+
+  async function undoExecute(input: any, context: any) {
+    const { abs, rel } = resolveInProject(projectDir, input?.file)
+    let diskLines: string[] | null
+    try {
+      diskLines = splitLines(await readDisk(abs, rel))
+    } catch (err: any) {
+      // Archivo borrado tras el edit: se recrea desde la sombra.
+      if (err instanceof AnchorStoreError && err.code === "E_FILE_NOT_FOUND") diskLines = null
+      else throw err
+    }
+    const store = storeFor(context.sessionID)
+    const restored = store.restoreShadow(rel, diskLines)
+    const newContent = restored.rows.map((r) => r.content).join("\n")
+    await writeFile(abs, newContent, "utf-8")
+    // El undo cierra los batches abiertos de este archivo: el próximo edit
+    // abre un nivel de undo fresco.
+    const sessionID = context?.sessionID
+    if (typeof sessionID === "string") {
+      for (const key of [...batches.keys()]) {
+        if (key.startsWith(`${sessionID}\n`) && key.endsWith(`\n${rel}`)) batches.delete(key)
+      }
+    }
+    const lines = [
+      `undo ${rel}: restored ${restored.rows.length} lines.`,
+      ...restored.rows.map((r) => `+ ${formatRow(r)}`),
+      `${restored.rows.length} lines total.`,
+      ...formatWarnings(restored.warnings),
+    ]
+    return {
+      content: lines.join("\n"),
+      metadata: { restored: true, file: rel, totalLines: restored.rows.length },
     }
   }
 
@@ -320,6 +462,19 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     },
     execute: insertExecute,
   }
+  const undoDef = {
+    name: "undo_last_change",
+    description: "Restore a file to its pre-edit state (single-level per file, persistent).",
+    input: {
+      type: "object",
+      properties: {
+        file: { type: "string" },
+      },
+      required: ["file"],
+      additionalProperties: false,
+    },
+    execute: undoExecute,
+  }
 
   await ctx.tool.transform((editor: any) => {
     if (editor.get("read")) {
@@ -333,9 +488,11 @@ export async function registerCoreTools(ctx: any): Promise<() => void> {
     }
     if (!editor.get("replace")) editor.add(replaceDef)
     if (!editor.get("insert")) editor.add(insertDef)
+    if (!editor.get("undo_last_change")) editor.add(undoDef)
   })
 
   return () => {
+    batches.clear()
     for (const store of stores.values()) store.close()
     stores.clear()
   }
