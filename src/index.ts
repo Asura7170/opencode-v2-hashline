@@ -5,6 +5,7 @@ import { Plugin } from "@opencode/plugin"
 
 import { type AnchorStore, createAnchorStore } from "./anchor-store"
 import { annotateAttachments, cleanupAtFile, createAtFileState } from "./atfile"
+import { registerCoreTools } from "./core-tools"
 
 export default Plugin.define({
   id: "opencode-hashline",
@@ -32,7 +33,10 @@ export default Plugin.define({
         // La admisión nunca se rompe por anotar.
       }
     })
+    // Sin ctx.tool (stubs parciales de otros tickets) no hay tools que registrar.
+    const cleanupTools = ctx.tool ? await registerCoreTools(ctx) : undefined
     return async () => {
+      await cleanupTools?.()
       for (const store of stores.values()) {
         try {
           store.close()
