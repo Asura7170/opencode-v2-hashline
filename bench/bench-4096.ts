@@ -27,12 +27,12 @@ function editedVariant(base: string[], rep: number, count: number): string[] {
   return next
 }
 
-function stats(xs: number[]): { median: number; mean: number; min: number; max: number } {
+function stats(xs: number[]): { median: number; mean: number } {
   const s = [...xs].sort((a, b) => a - b)
   const mean = xs.reduce((a, b) => a + b, 0) / xs.length
   const mid = Math.floor(s.length / 2)
   const median = s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid]
-  return { median, mean, min: s[0], max: s[s.length - 1] }
+  return { median, mean }
 }
 
 function fmt(ms: number): string {

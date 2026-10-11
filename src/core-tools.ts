@@ -11,6 +11,7 @@ import {
   type AnchorRow,
   type AnchorStore,
   type ResolvedAnchor,
+  type ResolvedRange,
   type ServeResult,
 } from "./anchor-store"
 
@@ -74,6 +75,32 @@ function resolveInProject(projectDir: string, file: unknown): { abs: string; rel
     throw new AnchorStoreError("E_PATH_EXCLUDED", `Path fuera del proyecto: "${file}"`)
   }
   return { abs, rel: rel.split(sep).join("/") }
+}
+
+// Args de copy/move (#13/#15): mismo contrato validado una sola vez.
+function parseTransferArgs(input: ToolCallInput): {
+  startAnchor: string
+  endAnchor: string | undefined
+  destAnchor: string
+  position: "before" | "after"
+} {
+  const { startAnchor, endAnchor, destAnchor, position } = input ?? {}
+  if (typeof startAnchor !== "string" || startAnchor.length === 0) {
+    throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro startAnchor requerido")
+  }
+  if (endAnchor !== undefined && (typeof endAnchor !== "string" || endAnchor.length === 0)) {
+    throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro endAnchor inválido")
+  }
+  if (typeof destAnchor !== "string" || destAnchor.length === 0) {
+    throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro destAnchor requerido")
+  }
+  if (position !== "before" && position !== "after") {
+    throw new AnchorStoreError(
+      "E_INVALID_INPUT",
+      `position debe ser "before" o "after": ${JSON.stringify(position)}`,
+    )
+  }
+  return { startAnchor, endAnchor, destAnchor, position }
 }
 
 // Rechazo pre-escritura espejo del store: evita dejar disco y store divergentes
@@ -573,6 +600,33 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
   }
 
+  // Lado origen de copy/move: serve + disjoint pre-commit + resolveRange +
+  // disjoint vía re-lectura. `label` distingue el mensaje ("copy"/"move").
+  async function resolveTransferSource(
+    store: AnchorStore,
+    batchSrc: BatchState | null,
+    srcRel: string,
+    srcDisk: string,
+    startAnchor: string,
+    endAnchor: string | undefined,
+    label: string,
+  ): Promise<{ srcRange: ResolvedRange; preAnchors: string[] }> {
+    const srcRows = await tracked(batchSrc, srcRel, async () => store.serve(srcRel, srcDisk).rows)
+    const where = `${label} origen ${startAnchor}-${endAnchor ?? startAnchor}`
+    // Pre-commit: re-copiar el mismo rango del batch es solape, no stale.
+    assertDisjoint(batchSrc, srcRel, [startAnchor, endAnchor ?? startAnchor], where)
+    let srcRange: ResolvedRange
+    try {
+      srcRange = store.resolveRange(srcRel, startAnchor, endAnchor ?? startAnchor)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
+    const preAnchors = srcRows.slice(srcRange.startLine - 1, srcRange.endLine).map((r) => r.anchor)
+    assertDisjoint(batchSrc, srcRel, preAnchors, where)
+    return { srcRange, preAnchors }
+  }
+
   // Camino de commit a destino compartido por copy (#13) y move (#15):
   // serve + resolve del punto, foto, cómputo, pre-escritura, write y commit.
   // Sin marcado de batch: cada llamador marca al final (move vacía el
@@ -587,6 +641,15 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     srcLines: string[],
   ): Promise<{ committed: ServeResult; dstResolved: ResolvedAnchor; idx: number }> {
     const dstDisk = await tracked(batchDst, dstRel, () => readDisk(dstAbs, dstRel))
+    // US7: el destino debe estar ya servido en la sesión; servirlo aquí
+    // auto-verificaría contexto no verificado. Falla stale sin servir ni
+    // dejar efecto lateral (cubre a copy y a move: mismo camino).
+    if (store.peek(dstRel) === null) {
+      throw new AnchorStoreError(
+        "E_ANCHOR_STALE",
+        `Destino no servido en esta sesión: "${dstRel}"; usa read para servirlo antes de copiar`,
+      )
+    }
     await tracked(batchDst, dstRel, async () => {
       store.serve(dstRel, dstDisk)
     })
@@ -624,22 +687,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs: srcAbs, rel: srcRel } = resolveInProject(projectDir, input?.file)
     const { abs: dstAbs, rel: dstRel } = resolveInProject(projectDir, input?.destFile)
-    const { startAnchor, endAnchor, destAnchor, position } = input ?? {}
-    if (typeof startAnchor !== "string" || startAnchor.length === 0) {
-      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro startAnchor requerido")
-    }
-    if (endAnchor !== undefined && (typeof endAnchor !== "string" || endAnchor.length === 0)) {
-      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro endAnchor inválido")
-    }
-    if (typeof destAnchor !== "string" || destAnchor.length === 0) {
-      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro destAnchor requerido")
-    }
-    if (position !== "before" && position !== "after") {
-      throw new AnchorStoreError(
-        "E_INVALID_INPUT",
-        `position debe ser "before" o "after": ${JSON.stringify(position)}`,
-      )
-    }
+    const { startAnchor, endAnchor, destAnchor, position } = parseTransferArgs(input)
     // Un batch por lado (misma clave si origen y destino coinciden): el undo
     // de cada archivo sigue funcionando por separado.
     const batchSrc = batchFor(context?.sessionID, context?.messageID, srcRel)
@@ -648,27 +696,14 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     if (batchDst !== batchSrc) assertBatchOpen(batchDst, dstRel)
     const srcDisk = await tracked(batchSrc, srcRel, () => readDisk(srcAbs, srcRel))
     const store = storeFor(context.sessionID)
-    const srcRows = await tracked(batchSrc, srcRel, async () => store.serve(srcRel, srcDisk).rows)
-    // Pre-commit: re-copiar el mismo rango del batch es solape, no stale.
-    assertDisjoint(
+    const { srcRange, preAnchors } = await resolveTransferSource(
+      store,
       batchSrc,
       srcRel,
-      [startAnchor, endAnchor ?? startAnchor],
-      `copy origen ${startAnchor}-${endAnchor ?? startAnchor}`,
-    )
-    let srcRange
-    try {
-      srcRange = store.resolveRange(srcRel, startAnchor, endAnchor ?? startAnchor)
-    } catch (err) {
-      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
-      throw err
-    }
-    const preAnchors = srcRows.slice(srcRange.startLine - 1, srcRange.endLine).map((r) => r.anchor)
-    assertDisjoint(
-      batchSrc,
-      srcRel,
-      preAnchors,
-      `copy origen ${startAnchor}-${endAnchor ?? startAnchor}`,
+      srcDisk,
+      startAnchor,
+      endAnchor,
+      "copy",
     )
     // Foto pre-escritura: el mismo-archivo copia duplicando, nunca mezcla.
     const srcLines = splitLines(srcDisk).slice(srcRange.startLine - 1, srcRange.endLine)
@@ -723,48 +758,21 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs: srcAbs, rel: srcRel } = resolveInProject(projectDir, input?.file)
     const { abs: dstAbs, rel: dstRel } = resolveInProject(projectDir, input?.destFile)
-    const { startAnchor, endAnchor, destAnchor, position } = input ?? {}
-    if (typeof startAnchor !== "string" || startAnchor.length === 0) {
-      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro startAnchor requerido")
-    }
-    if (endAnchor !== undefined && (typeof endAnchor !== "string" || endAnchor.length === 0)) {
-      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro endAnchor inválido")
-    }
-    if (typeof destAnchor !== "string" || destAnchor.length === 0) {
-      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro destAnchor requerido")
-    }
-    if (position !== "before" && position !== "after") {
-      throw new AnchorStoreError(
-        "E_INVALID_INPUT",
-        `position debe ser "before" o "after": ${JSON.stringify(position)}`,
-      )
-    }
+    const { startAnchor, endAnchor, destAnchor, position } = parseTransferArgs(input)
     const batchSrc = batchFor(context?.sessionID, context?.messageID, srcRel)
     const batchDst = batchFor(context?.sessionID, context?.messageID, dstRel)
     assertBatchOpen(batchSrc, srcRel)
     if (batchDst !== batchSrc) assertBatchOpen(batchDst, dstRel)
     const srcDisk = await tracked(batchSrc, srcRel, () => readDisk(srcAbs, srcRel))
     const store = storeFor(context.sessionID)
-    const srcRows = await tracked(batchSrc, srcRel, async () => store.serve(srcRel, srcDisk).rows)
-    assertDisjoint(
+    const { srcRange, preAnchors } = await resolveTransferSource(
+      store,
       batchSrc,
       srcRel,
-      [startAnchor, endAnchor ?? startAnchor],
-      `move origen ${startAnchor}-${endAnchor ?? startAnchor}`,
-    )
-    let srcRange
-    try {
-      srcRange = store.resolveRange(srcRel, startAnchor, endAnchor ?? startAnchor)
-    } catch (err) {
-      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
-      throw err
-    }
-    const preAnchors = srcRows.slice(srcRange.startLine - 1, srcRange.endLine).map((r) => r.anchor)
-    assertDisjoint(
-      batchSrc,
-      srcRel,
-      preAnchors,
-      `move origen ${startAnchor}-${endAnchor ?? startAnchor}`,
+      srcDisk,
+      startAnchor,
+      endAnchor,
+      "move",
     )
     const srcLines = splitLines(srcDisk).slice(srcRange.startLine - 1, srcRange.endLine)
 
