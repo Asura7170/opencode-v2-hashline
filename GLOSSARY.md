@@ -31,3 +31,19 @@ _Avoid_: prefijo, hash pegado
 **Undo por archivo**:
 Restauración de un archivo a su estado previo al último batch, de un solo nivel y persistente entre restarts.
 _Avoid_: historial, undo global
+
+**Match**:
+Ocurrencia de texto servido que `replace_match` sustituye por otro.
+_Avoid_: regex, búsqueda libre
+
+**Copy**:
+Edit que replica líneas servidas a un destino ya servido, sin heredar served-record.
+_Avoid_: duplicar, clonar
+
+**Move**:
+Copy cuyo origen se vacía solo cuando el destino ya commiteó.
+_Avoid_: renombrar, mover atómico
+
+**Grep de anchors**:
+Búsqueda que solo devuelve anchors ya servidos, sin servir nada nuevo.
+_Avoid_: grep de texto, búsqueda global
