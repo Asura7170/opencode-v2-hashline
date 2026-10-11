@@ -147,10 +147,10 @@ export function extractMentionedPaths(text: string): string[] {
 
 // Auto-read del #19: sirve lo mencionado con la misma clave relativa que
 // los tools, para que aguas abajo sea indistinguible de un `read` manual.
-// Gate (ADR-0001, conducta del #20): peek-first ante dueño ajeno, Cuota con
-// holgura sin reclamar, fuera/excluido/oversize con nota; tope 10 del #21.
-// shortcut: sin peek-first ni Cuota ni tope hasta el #20/#21; aquí solo
-// claves frescas en proyectos pequeños, lo demás se omite sin conducta.
+// Gate (#20, ADR-0001): fuera del proyecto con nota → peek-first ante dueño
+// ajeno (skip con nota, sin robar ni servir) → Cuota con holgura (skip con
+// nota, sin reclamar LRU) → servible (excluido/oversize/binario con nota vía
+// el rechazo del store, que no muta served-record). Tope 10 del #21.
 export async function autoServeMentionedPaths(
   text: string,
   projectDir: string,
@@ -158,41 +158,87 @@ export async function autoServeMentionedPaths(
   already?: Set<string>,
 ): Promise<{ served: AutoServeServed[]; skipped: AutoServeSkip[] }> {
   const served: AutoServeServed[] = []
+  const skipped: AutoServeSkip[] = []
   const seen = new Set<string>()
   for (const tok of extractMentionedPaths(text)) {
     const abs = resolve(projectDir, tok)
     if (seen.has(abs)) continue
     seen.add(abs)
     const rel = relativeKeyFor(projectDir, abs)
-    if (rel === null || already?.has(rel)) continue
+    if (rel === null) {
+      skipped.push({
+        file: tok,
+        reason: "fuera del proyecto (el Gate no abre lo que read rechaza)",
+      })
+      continue
+    }
+    if (already?.has(rel)) continue
     let content: string
     try {
       content = await readFile(abs, "utf-8")
     } catch {
       continue
     }
+    // Peek-first (CODING_STANDARDS.md): lo ajeno se salta antes de servir,
+    // que transferiría ownership y perdería sombras ajenas.
+    const owner = store.ownerOf(abs)
+    if (owner !== null && owner !== store.sessionId) {
+      skipped.push({
+        file: rel,
+        reason: "dueño de otra sesión (no se roba ownership ni se tocan sombras ajenas)",
+      })
+      continue
+    }
+    // Cuota con holgura: solo sirve si cabe, nunca reclama LRU. Re-servir lo
+    // propio descuenta lo ya servido (neto real del ingest, que libera antes).
+    const lines = content.replace(/\r\n/g, "\n").split("\n").length
+    const netNew = lines - (store.peek(abs)?.length ?? 0)
+    const quota = store.usage()
+    if (netNew > 0 && quota.used + netNew > quota.max) {
+      skipped.push({
+        file: rel,
+        reason: `sin Cuota libre bajo maxAnchors ${quota.max} (${quota.used} en uso, ${lines} pedidas; no se reclama LRU)`,
+      })
+      continue
+    }
     let rows: AnchorRow[]
     try {
       rows = store.serve(abs, content).rows
     } catch (err) {
-      if (err instanceof AnchorStoreError) continue
+      // E_PATH_EXCLUDED | E_FILE_OVERSIZE | E_FILE_BINARY: el rechazo no
+      // muta el served-record; viaja como nota motivada sin código E_.
+      if (err instanceof AnchorStoreError) {
+        skipped.push({ file: rel, reason: err.message.replace(/^\[[^\]]+\] /, "") })
+        continue
+      }
       throw err
     }
     served.push({ file: rel, lines: rows.length, rows })
   }
-  return { served, skipped: [] }
+  return { served, skipped }
 }
 
 // Resumen por mensaje: una línea H_ con todo lo auto-servido (adjuntos
-// anotados + mencionados) y las filas de los mencionados, que no tienen
-// temp donde mostrarse. Null si nada se sirvió.
+// anotados + mencionados), cada skip motivado y las filas de los
+// mencionados, que no tienen temp donde mostrarse. Null si nada se sirvió
+// ni se saltó.
 export function formatAutoReadNote(
   attachments: AutoServeSummary[],
   mentioned: AutoServeServed[],
+  skipped: AutoServeSkip[] = [],
 ): string | null {
   const all: AutoServeSummary[] = [...attachments, ...mentioned]
-  if (all.length === 0) return null
-  const head = `H_AUTO_READ: served ${all.length} file(s): ${all.map((s) => `${s.file} (${s.lines} line${s.lines === 1 ? "" : "s"})`).join("; ")}.`
+  if (all.length === 0 && skipped.length === 0) return null
+  const parts: string[] = []
+  if (all.length > 0) {
+    parts.push(`served ${all.length} file(s): ${all.map((s) => `${s.file} (${s.lines} line${s.lines === 1 ? "" : "s"})`).join("; ")}.`)
+  }
+  if (skipped.length > 0) {
+    parts.push(
+      `skipped ${skipped.length} file(s): ${skipped.map((s) => `${s.file} (${s.reason})`).join("; ")}.`,
+    )
+  }
+  const head = `H_AUTO_READ: ${parts.join(" ")}`
   const sections = mentioned.map(
     (m) => `${m.file}:\n${m.rows.map((r) => `${r.anchor}│${r.content}`).join("\n")}`,
   )
