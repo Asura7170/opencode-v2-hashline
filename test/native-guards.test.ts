@@ -69,6 +69,7 @@ describe("strip de ecos en edits nativos", () => {
       "replace_match",
       "insert",
       "copy",
+      "move",
       "undo_last_change",
       "anchor_grep",
     ]) {
