@@ -5,9 +5,18 @@ import { dirname, join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 
 import { type AnchorStore, createAnchorStore } from "./anchor-store"
-import { annotateAttachments, cleanupAtFile, createAtFileState } from "./atfile"
+import {
+  annotateAttachments,
+  autoServeMentionedPaths,
+  cleanupAtFile,
+  createAtFileState,
+  formatAutoReadNote,
+  toFsPath,
+  type AutoServeSummary,
+} from "./atfile"
 import {
   loadHashlineConfig,
+  relativeKeyFor,
   storePathFor,
   withProjectKeys,
   type HashlineConfig,
@@ -65,11 +74,10 @@ export default Plugin.define({
     await ctx.session.hook("prompt", async (input) => {
       try {
         const store = storeFor(input.sessionID)
-        const skipped = await annotateAttachments(
-          input.prompt.files as { uri: string }[] | undefined,
-          projectDir ? withProjectKeys(store, projectDir) : store,
-          atfile,
-        )
+        const projStore = projectDir ? withProjectKeys(store, projectDir) : store
+        const files = input.prompt.files as { uri: string }[] | undefined
+        const before = (files ?? []).map((f) => f?.uri)
+        const skipped = await annotateAttachments(files, projStore, atfile)
         // Admisión explícita sin romperla: los omitidos por guarda viajan
         // como nota visible en el prompt (el host admite igual el adjunto
         // original). Sin duplicar en re-ejecuciones del hook.
@@ -79,6 +87,36 @@ export default Plugin.define({
             const detail = skipped.map((s) => `${s.code}: ${s.uri}`).join("; ")
             input.prompt.text += `\n${marker}: ${skipped.length} attachment(s) admitted without anchors (${detail}).`
           }
+        }
+        // Auto-read (#19): lo mencionado en el texto con la misma clave que
+        // los tools + resumen por mensaje de todo lo auto-servido. Sin
+        // proyecto no hay claves relativas: solo adjuntos como antes.
+        if (
+          projectDir &&
+          typeof input.prompt?.text === "string" &&
+          !input.prompt.text.includes("H_AUTO_READ")
+        ) {
+          const attached: AutoServeSummary[] = []
+          if (files) {
+            for (let i = 0; i < files.length; i++) {
+              if (!files[i] || files[i].uri === before[i]) continue
+              let orig: string
+              try {
+                orig = toFsPath(before[i])
+              } catch {
+                continue
+              }
+              const rel = relativeKeyFor(projectDir, orig)
+              if (rel === null) continue
+              const rows = projStore.peek(orig)
+              if (!rows) continue
+              attached.push({ file: rel, lines: rows.length })
+            }
+          }
+          const already = new Set(attached.map((a) => a.file))
+          const { served } = await autoServeMentionedPaths(input.prompt.text, projectDir, projStore, already)
+          const note = formatAutoReadNote(attached, served)
+          if (note) input.prompt.text += note
         }
       } catch {
         // La admisión nunca se rompe por anotar.
