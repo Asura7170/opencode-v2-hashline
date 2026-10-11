@@ -22,7 +22,7 @@ export const SYSTEM_PROMPT_MARKER = "hashline anchors:"
 
 export const SYSTEM_PROMPT = [
   "hashline anchors: `read` serves `anchor│content` rows; anchors are 4-letter, allocated per line and stable across edits of untouched lines — reference anchors, never line numbers.",
-  "Edit via hashline tools: `replace` (startAnchor/endAnchor + content), `insert` (anchor + before/after + content); every edit returns a diff with live anchors. `undo_last_change` reverts one batch per file.",
+  "Edit via hashline tools: `replace` (startAnchor/endAnchor + content), `replace_match` (match + content), `insert` (anchor + before/after + content); every edit returns a diff with live anchors. `undo_last_change` reverts one batch per file.",
   "Never paste `anchor│` prefixes into native tools: native `edit` strips them (with an H_ECHO_STRIPPED notice); native `write` containing them fails with E_ANCHOR_ECHO — use the hashline tools instead.",
   "Stale anchors fail with E_ANCHOR_STALE plus current rows: re-read and retry. Identical rewrites report H_NOOP without writing.",
 ].join("\n")
@@ -59,7 +59,7 @@ export interface GuardHost {
 
 // Tools propias: el wrapper codemode `execute` también dispara hooks,
 // así que se omiten por nombre (además el strip ya es idempotente).
-const OWN_TOOLS = new Set(["read", "replace", "insert", "undo_last_change", "anchor_grep"])
+const OWN_TOOLS = new Set(["read", "replace", "replace_match", "insert", "undo_last_change", "anchor_grep"])
 
 export function stripEchoedAnchors(text: string): { text: string; stripped: number } {
   let stripped = 0
