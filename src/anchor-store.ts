@@ -77,6 +77,8 @@ export interface AnchorStore {
   resolveRange(filePath: string, startAnchor: string, endAnchor: string): ResolvedRange
   /** Filas servidas propias sin tocar seq ni persistir (lectura para anchor_grep). */
   peek(filePath: string): AnchorRow[] | null
+  /** Guardas puras (excluido/oversize/binario) sin mutar served-record. */
+  checkServable(filePath: string, content: string): void
   /** Dueño del served-record, o null si jamás servido. Lectura sin efectos. */
   ownerOf(filePath: string): string | null
   /** Uso de Cuota: anchors vivos y tope. Lectura sin efectos. */
@@ -401,6 +403,9 @@ export function createAnchorStore(opts: AnchorStoreOptions): AnchorStore {
       const entry = files.get(filePath)
       if (!entry || entry.owner !== opts.sessionId) return null
       return toRows(entry.lines)
+    },
+    checkServable(filePath: string, content: string): void {
+      checkGuards(filePath, content)
     },
     ownerOf(filePath: string): string | null {
       return files.get(filePath)?.owner ?? null

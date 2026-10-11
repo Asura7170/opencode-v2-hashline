@@ -40,6 +40,21 @@ describe("extractMentionedPaths", () => {
   test("ignora palabras sin forma de path y URLs", () => {
     expect(extractMentionedPaths("esto no https://x.io/a.txt")).toEqual([])
   })
+
+  test("segmentos entrecomillados conservan paths con espacios", () => {
+    expect(extractMentionedPaths('revisa "mi archivo.txt" y otro.txt')).toEqual([
+      "mi archivo.txt",
+      "otro.txt",
+    ])
+    expect(extractMentionedPaths("mira 'mi otro doc.md', luego c.txt.")).toEqual([
+      "mi otro doc.md",
+      "c.txt",
+    ])
+  })
+
+  test("entrecomillado sin forma de path no rastrea libre", () => {
+    expect(extractMentionedPaths('di "hola mundo" sin más')).toEqual([])
+  })
 })
 
 describe("autoServeMentionedPaths", () => {
@@ -68,7 +83,7 @@ describe("autoServeMentionedPaths", () => {
     store.close()
   })
 
-  test("fuera del proyecto se salta con nota; lo ilegible sigue silencioso", async () => {
+  test("fuera del proyecto se salta con nota; lo ilegible deja skip motivado", async () => {
     const dir = project()
     writeFileSync(join(dir, "ok.txt"), "a\nb")
     const store = memStore()
@@ -79,10 +94,46 @@ describe("autoServeMentionedPaths", () => {
       proj,
     )
     expect(served.map((s) => s.file)).toEqual(["ok.txt"])
-    // Gate del #20: fuera del proyecto deja nota motivada; lo ilegible
-    // (missing.txt) no tiene nada accionable que decir y sigue silencioso.
-    expect(skipped.map((s) => s.file)).toEqual(["../fuera.txt"])
+    // Gate: fuera del proyecto deja nota motivada; lo ilegible (missing.txt,
+    // borrado tras mencionar) también deja skip con nota, sin E_ nuevos.
+    expect(skipped.map((s) => s.file)).toEqual(["../fuera.txt", "missing.txt"])
     expect(skipped[0].reason).toMatch(/fuera del proyecto/)
+    expect(skipped[1].reason).toMatch(/no se pudo leer/)
+    expect(skipped[1].reason).toMatch(/no existe o fue borrado/)
+    for (const s of skipped) expect(s.reason).not.toMatch(/E_[A-Z_]+/)
+    expect(proj.peek(join(dir, "missing.txt"))).toBeNull()
+    store.close()
+  })
+
+  test("path con espacios entrecomillado queda servido", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "mi archivo.txt"), "one\ntwo")
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths(
+      'revisa "mi archivo.txt" por favor',
+      dir,
+      proj,
+    )
+    expect(skipped).toEqual([])
+    expect(served.map((s) => s.file)).toEqual(["mi archivo.txt"])
+    expect(proj.peek(join(dir, "mi archivo.txt"))?.map((r) => r.content)).toEqual(["one", "two"])
+    store.close()
+  })
+
+  test("directorio mencionado deja skip motivado, sin servir", async () => {
+    const dir = project()
+    mkdirSync(join(dir, "sub"))
+    writeFileSync(join(dir, "ok.txt"), "a\nb")
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths("mira ok.txt sub/", dir, proj)
+    expect(served.map((s) => s.file)).toEqual(["ok.txt"])
+    expect(skipped.map((s) => s.file)).toEqual(["sub"])
+    expect(skipped[0].reason).toMatch(/no se pudo leer/)
+    expect(skipped[0].reason).toMatch(/directorio/)
+    expect(skipped[0].reason).not.toMatch(/E_[A-Z_]+/)
+    expect(proj.peek(join(dir, "sub"))).toBeNull()
     store.close()
   })
 })
@@ -159,6 +210,53 @@ describe("Gate de skips #20", () => {
     expect(skipped[0].reason).toMatch(/excede/)
     expect(proj.peek(join(dir, "big.txt"))).toBeNull()
     store.close()
+  })
+
+  test("excluido y ajeno → motivo excluido (orden del Gate)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "clash.min.js"), "x\ny")
+    const db = sharedDb("excl-ajeno")
+    // Clave relativa real servida en sesión ajena con excludes vacíos (con los
+    // defaults no podría servirse: el anchor inventado queda prohibido).
+    const otra = createAnchorStore({ sessionId: "s-otra", storePath: db, excludes: [] })
+    const foreignAnchor = otra.serve("clash.min.js", "x\ny").rows[0].anchor
+    otra.close()
+    const store = createAnchorStore({ sessionId: "s-mia", storePath: db })
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths("mira clash.min.js", dir, proj)
+    expect(served).toEqual([])
+    expect(skipped.map((s) => s.file)).toEqual(["clash.min.js"])
+    expect(skipped[0].reason).toMatch(/excluido/i)
+    expect(skipped[0].reason).not.toMatch(/otra sesi/)
+    expect(skipped[0].reason).not.toMatch(/E_[A-Z_]+/)
+    expect(proj.peek(join(dir, "clash.min.js"))).toBeNull()
+    store.close()
+    // La otra sesión conserva ownership intacto.
+    const vuelta = createAnchorStore({ sessionId: "s-otra", storePath: db, excludes: [] })
+    expect(vuelta.resolve("clash.min.js", foreignAnchor)).toEqual({ line: 1, content: "x" })
+    vuelta.close()
+  })
+
+  test("oversize y ajeno → motivo oversize (orden del Gate)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "gordo.txt"), "0123456789\n")
+    const db = sharedDb("gordo-ajeno")
+    const otra = createAnchorStore({ sessionId: "s-otra", storePath: db })
+    const foreignAnchor = otra.serve("gordo.txt", "0123456789\n").rows[0].anchor
+    otra.close()
+    const store = createAnchorStore({ sessionId: "s-mia", storePath: db, maxFileBytes: 8 })
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths("mira gordo.txt", dir, proj)
+    expect(served).toEqual([])
+    expect(skipped.map((s) => s.file)).toEqual(["gordo.txt"])
+    expect(skipped[0].reason).toMatch(/excede/)
+    expect(skipped[0].reason).not.toMatch(/otra sesi/)
+    expect(skipped[0].reason).not.toMatch(/E_[A-Z_]+/)
+    expect(proj.peek(join(dir, "gordo.txt"))).toBeNull()
+    store.close()
+    const vuelta = createAnchorStore({ sessionId: "s-otra", storePath: db })
+    expect(vuelta.resolve("gordo.txt", foreignAnchor)).toEqual({ line: 1, content: "0123456789" })
+    vuelta.close()
   })
 
   test("ningún skip abre served-record: cero E_ nuevos en los motivos", async () => {

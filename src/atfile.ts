@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
-import { AnchorStoreError, type AnchorRow, type AnchorStore } from "./anchor-store"
+import { AnchorStoreError, errorCode, type AnchorRow, type AnchorStore } from "./anchor-store"
 import { relativeKeyFor } from "./config"
 import { ANCHOR_SHAPE_SOURCE } from "./native-guards"
 
@@ -139,24 +139,61 @@ export interface AutoServeSummary {
 const MAX_AUTO_READ_PER_MESSAGE = 10
 
 // shortcut: solo tokens con '.'/'/'/'\' prueban disco; sin él cada palabra costaría un read.
+// La comilla solo abre segmento si empieza token (cur vacío): el apóstrofo de
+// "don't" sigue literal y no traga el resto del mensaje.
 export function extractMentionedPaths(text: string): string[] {
   const seen = new Set<string>()
-  for (const raw of text.split(/\s+/)) {
+  const push = (raw: string): void => {
     const tok = raw.replace(/^[@<('"[`]+/, "").replace(/[.,;:!?)"'`\]>]+$/, "")
-    if (tok.length === 0 || tok.length > 256) continue
-    if (!tok.includes("/") && !tok.includes(".") && !tok.includes("\\")) continue
-    if (tok.includes("://")) continue
+    if (tok.length === 0 || tok.length > 256) return
+    if (!tok.includes("/") && !tok.includes(".") && !tok.includes("\\")) return
+    if (tok.includes("://")) return
     if (!seen.has(tok)) seen.add(tok)
   }
+  let cur = ""
+  let quote: string | null = null
+  const flush = (): void => {
+    if (cur !== "") {
+      push(cur)
+      cur = ""
+    }
+  }
+  for (const c of text) {
+    if (quote !== null) {
+      if (c === quote) {
+        flush()
+        quote = null
+      } else {
+        cur += c
+      }
+    } else if ((c === '"' || c === "'") && cur === "") {
+      quote = c
+    } else if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v") {
+      flush()
+    } else {
+      cur += c
+    }
+  }
+  flush()
   return [...seen]
+}
+
+// Ilegible en disco (borrado, permiso, directorio): skip con nota motivada,
+// sin E_ nuevos (US7). errorCode trae el código del SO (ENOENT, EACCES…).
+function unreadableReason(code: string | undefined): string {
+  if (code === "ENOENT") return "no se pudo leer (no existe o fue borrado)"
+  if (code === "EACCES" || code === "EPERM") return "no se pudo leer (sin permiso de lectura)"
+  if (code === "EISDIR") return "no se pudo leer (es un directorio, no un archivo)"
+  return "no se pudo leer (ilegible desde disco)"
 }
 
 // Auto-read del #19: sirve lo mencionado con la misma clave relativa que
 // los tools, para que aguas abajo sea indistinguible de un `read` manual.
-// Gate (#20, ADR-0001): fuera del proyecto con nota → peek-first ante dueño
-// ajeno (skip con nota, sin robar ni servir) → Cuota con holgura (skip con
-// nota, sin reclamar LRU) → servible (excluido/oversize/binario con nota vía
-// el rechazo del store, que no muta served-record). Tope 10 del #21.
+// Gate en orden del spec (ADR-0001): dentro del proyecto → excluido (antes de
+// disco y ownership) → servible (ilegible con nota, US7) → oversize/binario →
+// peek-first ante dueño ajeno (skip con nota, sin robar ni servir) → Cuota con
+// holgura (skip con nota, sin reclamar LRU) → tope 10. Todo skip es lectura
+// sin efectos: ningún skip abre served-record. Tope 10 del #21.
 export async function autoServeMentionedPaths(
   text: string,
   projectDir: string,
@@ -168,6 +205,9 @@ export async function autoServeMentionedPaths(
   const seen = new Set<string>()
   // Los adjuntos ya servidos en este mensaje consumen cupo del tope.
   const servedBudget = (): number => (already?.size ?? 0) + served.length
+  // Rechazo de guarda como nota motivada, sin código E_ (US7/US10).
+  const gateNote = (err: unknown): string | null =>
+    err instanceof AnchorStoreError ? err.message.replace(/^\[[^\]]+\] /, "") : null
   for (const tok of extractMentionedPaths(text)) {
     const abs = resolve(projectDir, tok)
     if (seen.has(abs)) continue
@@ -181,10 +221,30 @@ export async function autoServeMentionedPaths(
       continue
     }
     if (already?.has(rel)) continue
+    // Excluido antes de disco y de ownership: con contenido vacío solo pican
+    // excluido/extensión, sin mutar served-record.
+    try {
+      store.checkServable(abs, "")
+    } catch (err) {
+      const reason = gateNote(err)
+      if (reason === null) throw err
+      skipped.push({ file: rel, reason })
+      continue
+    }
     let content: string
     try {
       content = await readFile(abs, "utf-8")
-    } catch {
+    } catch (err) {
+      skipped.push({ file: rel, reason: unreadableReason(errorCode(err)) })
+      continue
+    }
+    // Oversize/binario antes de ownership y Cuota.
+    try {
+      store.checkServable(abs, content)
+    } catch (err) {
+      const reason = gateNote(err)
+      if (reason === null) throw err
+      skipped.push({ file: rel, reason })
       continue
     }
     // Peek-first (CODING_STANDARDS.md): lo ajeno se salta antes de servir,
@@ -222,13 +282,12 @@ export async function autoServeMentionedPaths(
     try {
       rows = store.serve(abs, content).rows
     } catch (err) {
-      // E_PATH_EXCLUDED | E_FILE_OVERSIZE | E_FILE_BINARY: el rechazo no
-      // muta el served-record; viaja como nota motivada sin código E_.
-      if (err instanceof AnchorStoreError) {
-        skipped.push({ file: rel, reason: err.message.replace(/^\[[^\]]+\] /, "") })
-        continue
-      }
-      throw err
+      // Red de carrera: el precheck ya pasó; si el disco cambió entremedias
+      // el rechazo no muta el served-record y viaja como nota sin código E_.
+      const reason = gateNote(err)
+      if (reason === null) throw err
+      skipped.push({ file: rel, reason })
+      continue
     }
     served.push({ file: rel, lines: rows.length, rows })
   }
