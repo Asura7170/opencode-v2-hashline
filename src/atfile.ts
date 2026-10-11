@@ -132,6 +132,12 @@ export interface AutoServeSummary {
   lines: number
 }
 
+// Tope fijo del #21 (spec fase 3: número fijo y pequeño, sin bench ni
+// tuning; cero claves nuevas de config): como máximo se auto-sirven 10
+// archivos por mensaje; el resto queda en nota. Cuenta servidos, no
+// intentos: un skip del Gate no consume cupo.
+const MAX_AUTO_READ_PER_MESSAGE = 10
+
 // shortcut: solo tokens con '.'/'/'/'\' prueban disco; sin él cada palabra costaría un read.
 export function extractMentionedPaths(text: string): string[] {
   const seen = new Set<string>()
@@ -160,6 +166,8 @@ export async function autoServeMentionedPaths(
   const served: AutoServeServed[] = []
   const skipped: AutoServeSkip[] = []
   const seen = new Set<string>()
+  // Los adjuntos ya servidos en este mensaje consumen cupo del tope.
+  const servedBudget = (): number => (already?.size ?? 0) + served.length
   for (const tok of extractMentionedPaths(text)) {
     const abs = resolve(projectDir, tok)
     if (seen.has(abs)) continue
@@ -198,6 +206,15 @@ export async function autoServeMentionedPaths(
       skipped.push({
         file: rel,
         reason: `sin Cuota libre bajo maxAnchors ${quota.max} (${quota.used} en uso, ${lines} pedidas; no se reclama LRU)`,
+      })
+      continue
+    }
+    // Tope 10 (#21, último del Gate): solo frena lo que pasaría todo lo
+    // anterior; los skips del Gate ya continuaron sin tocar el cupo.
+    if (servedBudget() >= MAX_AUTO_READ_PER_MESSAGE) {
+      skipped.push({
+        file: rel,
+        reason: "tope 10 por mensaje (los 10 primeros se sirven, el resto queda en nota)",
       })
       continue
     }
