@@ -352,11 +352,19 @@ describe("t10 contrato de registro con el host (e2e 2.0.26)", () => {
     expect(tools.get("read").output).toBeUndefined()
   })
 
-  test("las 4 tools quedan directas al provider (codemode false, como el read nativo)", async () => {
+  test("las tools quedan directas al provider (codemode false, como el read nativo)", async () => {
     const dir = project()
     writeFileSync(join(dir, "a.txt"), "one")
     const { tools, cleanup } = await setup(dir)
-    for (const name of ["read", "replace", "replace_match", "insert", "undo_last_change"]) {
+    for (const name of [
+      "read",
+      "replace",
+      "replace_match",
+      "insert",
+      "copy",
+      "undo_last_change",
+      "anchor_grep",
+    ]) {
       expect(tools.get(name)?.options).toEqual({ codemode: false })
     }
     await cleanup?.()

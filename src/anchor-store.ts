@@ -139,7 +139,8 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`${out}$`)
 }
 
-export function isExcluded(filePath: string, patterns: string[]): boolean {  const normalized = filePath.replace(/\\/g, "/")
+export function isExcluded(filePath: string, patterns: string[]): boolean {
+  const normalized = filePath.replace(/\\/g, "/")
   return patterns.some((p) => globToRegExp(p).test(normalized))
 }
 

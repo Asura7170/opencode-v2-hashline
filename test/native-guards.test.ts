@@ -63,7 +63,15 @@ describe("strip de ecos en edits nativos", () => {
   test("no toca las tools propias aunque traigan anchors", async () => {
     const { ctx, toolHooks } = stubHost()
     await plugin.setup(ctx)
-    for (const tool of ["read", "replace", "replace_match", "insert", "undo_last_change"]) {
+    for (const tool of [
+      "read",
+      "replace",
+      "replace_match",
+      "insert",
+      "copy",
+      "undo_last_change",
+      "anchor_grep",
+    ]) {
       const input = { file: "a.txt", content: "aaaa│x" }
       await toolHooks.get("execute.before")!(beforeInput(tool, input))
       expect(input.content).toBe("aaaa│x")
