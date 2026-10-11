@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -182,5 +182,26 @@ describe("t19 auto-serve por hook", () => {
     ).rejects.toThrow(/E_UNDO_EMPTY/)
     expect(await readFile(join(dir, "nuevo.txt"), "utf-8")).toBe("c\nd")
     await (cleanup as () => Promise<void>)()
+  })
+
+  // Retro fase 3: mapeo EACCES con nota motivada. chmod no es fiable en
+  // Windows: ahí el test pasa vacío y CI (ubuntu) lo cubre de verdad.
+  test("sin permiso deja skip motivado", async () => {
+    if (process.platform === "win32") return
+    const dir = project()
+    const target = join(dir, "locked.txt")
+    writeFileSync(target, "secreto")
+    chmodSync(target, 0o000)
+    try {
+      const { ctx, hooks } = makeCtx(dir)
+      const cleanup = (await plugin.setup(ctx)) as () => Promise<void>
+      const prompt = await promptOf(hooks, "s6", { text: "revisa locked.txt" })
+      expect(prompt.text).toMatch(/H_AUTO_READ/)
+      expect(prompt.text).toContain("locked.txt")
+      expect(prompt.text).toMatch(/permiso/)
+      await (cleanup as () => Promise<void>)()
+    } finally {
+      chmodSync(target, 0o644)
+    }
   })
 })
