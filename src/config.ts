@@ -182,6 +182,7 @@ function keyForFile(projectDir: string, filePath: string): string {
 // Vista del store compartido con claves de proyecto para el hook de admisión.
 export function withProjectKeys(store: AnchorStore, projectDir: string): AnchorStore {
   return {
+    sessionId: store.sessionId,
     serve: (filePath, content) => store.serve(keyForFile(projectDir, filePath), content),
     commit: (filePath, newContent, commitOpts) =>
       store.commit(keyForFile(projectDir, filePath), newContent, commitOpts),
@@ -189,6 +190,8 @@ export function withProjectKeys(store: AnchorStore, projectDir: string): AnchorS
     resolveRange: (filePath, startAnchor, endAnchor) =>
       store.resolveRange(keyForFile(projectDir, filePath), startAnchor, endAnchor),
     peek: (filePath) => store.peek(keyForFile(projectDir, filePath)),
+    ownerOf: (filePath) => store.ownerOf(keyForFile(projectDir, filePath)),
+    usage: () => store.usage(),
     undoShadow: (filePath) => store.undoShadow(keyForFile(projectDir, filePath)),
     restoreShadow: (filePath, diskLines) =>
       store.restoreShadow(keyForFile(projectDir, filePath), diskLines),

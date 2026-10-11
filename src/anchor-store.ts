@@ -69,12 +69,18 @@ export interface ResolvedRange {
 }
 
 export interface AnchorStore {
+  /** Sesión que firma ownership al servir desde este handle. */
+  readonly sessionId: string
   serve(filePath: string, content: string): ServeResult
   commit(filePath: string, newContent: string, opts?: { keepShadow?: boolean }): ServeResult
   resolve(filePath: string, anchor: string): ResolvedAnchor
   resolveRange(filePath: string, startAnchor: string, endAnchor: string): ResolvedRange
   /** Filas servidas propias sin tocar seq ni persistir (lectura para anchor_grep). */
   peek(filePath: string): AnchorRow[] | null
+  /** Dueño del served-record, o null si jamás servido. Lectura sin efectos. */
+  ownerOf(filePath: string): string | null
+  /** Uso de Cuota: anchors vivos y tope. Lectura sin efectos. */
+  usage(): { used: number; max: number }
   undoShadow(filePath: string): string[] | null
   restoreShadow(filePath: string, diskLines: string[] | null): ServeResult
   close(): void
@@ -344,6 +350,7 @@ export function createAnchorStore(opts: AnchorStoreOptions): AnchorStore {
   }
 
   return {
+    sessionId: opts.sessionId,
     serve(filePath: string, content: string): ServeResult {
       const old = files.get(filePath)
       const sameOwner = !!old && old.owner === opts.sessionId
@@ -394,6 +401,12 @@ export function createAnchorStore(opts: AnchorStoreOptions): AnchorStore {
       const entry = files.get(filePath)
       if (!entry || entry.owner !== opts.sessionId) return null
       return toRows(entry.lines)
+    },
+    ownerOf(filePath: string): string | null {
+      return files.get(filePath)?.owner ?? null
+    },
+    usage(): { used: number; max: number } {
+      return { used: totalAnchors, max: maxAnchors }
     },
     undoShadow(filePath: string): string[] | null {
       const entry = files.get(filePath)

@@ -13,7 +13,7 @@ function project(): string {
   return mkdtempSync(join(tmpdir(), "t19-wire-"))
 }
 
-function makeCtx(projectDir: string) {
+function makeCtx(projectDir: string, options: Record<string, unknown> = {}) {
   const tools = new Map<string, { execute: (input: unknown, ctx: unknown) => Promise<unknown> }>()
   const hooks = new Map<string, (input: unknown) => Promise<void> | void>()
   const ctx = {
@@ -21,7 +21,7 @@ function makeCtx(projectDir: string) {
       directory: projectDir,
       project: { id: "t19-proj", directory: projectDir, canonical: projectDir },
     },
-    options: {},
+    options,
     session: {
       hook: async (name: string, cb: (input: unknown) => Promise<void> | void) => {
         hooks.set(name, cb)
@@ -134,8 +134,7 @@ describe("t19 auto-serve por hook", () => {
   })
 
   // AC4: indistinguible aguas abajo — read tras auto-serve no realoca, edit+undo iguales.
-  test("auto-servido indistinguible: read estable + edit + undo", async () => {
-    const dir = project()
+  test("auto-servido indistinguible: read estable + edit + undo", async () => {    const dir = project()
     writeFileSync(join(dir, "d.txt"), "k1\nk2")
     const { ctx, tools, hooks } = makeCtx(dir)
     const cleanup = (await plugin.setup(ctx)) as () => Promise<void>
@@ -155,6 +154,33 @@ describe("t19 auto-serve por hook", () => {
     const undo = tools.get("undo_last_change")!
     await undo.execute({ file: "d.txt" }, callCtx("s4", "m3"))
     expect(await readFile(join(dir, "d.txt"), "utf-8")).toBe("k1\nk2")
+    await (cleanup as () => Promise<void>)()
+  })
+
+  // Gate #20: cada skip motivado en el resumen, sin servir ni abrir batch.
+  test("skips motivados en el resumen sin served-record ni batch", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "ok.txt"), "a\nb")
+    writeFileSync(join(dir, "nuevo.txt"), "c\nd")
+    // Cuota para 2 anchors: ok.txt cabe, nuevo.txt ya no.
+    const { ctx, tools, hooks } = makeCtx(dir, { maxAnchors: 2 })
+    const cleanup = (await plugin.setup(ctx)) as () => Promise<void>
+    const prompt = await promptOf(hooks, "s5", { text: "revisa ok.txt nuevo.txt y ../fuera.txt" })
+    expect(prompt.text).toMatch(/H_AUTO_READ/)
+    expect(prompt.text).toContain("ok.txt (2 lines)")
+    expect(prompt.text).toMatch(/nuevo\.txt.*[Cc]uota/)
+    expect(prompt.text).toMatch(/fuera del proyecto/)
+    // Sin served-record: grep lo ve no servido (lectura sin efectos).
+    const grep = (await tools.get("anchor_grep")!.execute(
+      { file: "nuevo.txt", pattern: "c" },
+      callCtx("s5", "m1"),
+    )) as { metadata: { served: boolean } }
+    expect(grep.metadata.served).toBe(false)
+    // Sin batch ni sombra: el undo no tiene nada que deshacer.
+    await expect(
+      tools.get("undo_last_change")!.execute({ file: "nuevo.txt" }, callCtx("s5", "m2")),
+    ).rejects.toThrow(/E_UNDO_EMPTY/)
+    expect(await readFile(join(dir, "nuevo.txt"), "utf-8")).toBe("c\nd")
     await (cleanup as () => Promise<void>)()
   })
 })

@@ -114,8 +114,8 @@ export default Plugin.define({
             }
           }
           const already = new Set(attached.map((a) => a.file))
-          const { served } = await autoServeMentionedPaths(input.prompt.text, projectDir, projStore, already)
-          const note = formatAutoReadNote(attached, served)
+          const { served, skipped } = await autoServeMentionedPaths(input.prompt.text, projectDir, projStore, already)
+          const note = formatAutoReadNote(attached, served, skipped)
           if (note) input.prompt.text += note
         }
       } catch {
