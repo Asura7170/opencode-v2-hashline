@@ -73,6 +73,8 @@ export interface AnchorStore {
   commit(filePath: string, newContent: string, opts?: { keepShadow?: boolean }): ServeResult
   resolve(filePath: string, anchor: string): ResolvedAnchor
   resolveRange(filePath: string, startAnchor: string, endAnchor: string): ResolvedRange
+  /** Filas servidas propias sin tocar seq ni persistir (lectura para anchor_grep). */
+  peek(filePath: string): AnchorRow[] | null
   undoShadow(filePath: string): string[] | null
   restoreShadow(filePath: string, diskLines: string[] | null): ServeResult
   close(): void
@@ -137,8 +139,7 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`${out}$`)
 }
 
-function isExcluded(filePath: string, patterns: string[]): boolean {
-  const normalized = filePath.replace(/\\/g, "/")
+export function isExcluded(filePath: string, patterns: string[]): boolean {  const normalized = filePath.replace(/\\/g, "/")
   return patterns.some((p) => globToRegExp(p).test(normalized))
 }
 
@@ -387,6 +388,11 @@ export function createAnchorStore(opts: AnchorStoreOptions): AnchorStore {
         )
       }
       return { startLine: start.line, endLine: end.line }
+    },
+    peek(filePath: string): AnchorRow[] | null {
+      const entry = files.get(filePath)
+      if (!entry || entry.owner !== opts.sessionId) return null
+      return toRows(entry.lines)
     },
     undoShadow(filePath: string): string[] | null {
       const entry = files.get(filePath)

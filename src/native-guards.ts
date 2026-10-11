@@ -59,7 +59,7 @@ export interface GuardHost {
 
 // Tools propias: el wrapper codemode `execute` también dispara hooks,
 // así que se omiten por nombre (además el strip ya es idempotente).
-const OWN_TOOLS = new Set(["read", "replace", "replace_match", "insert", "undo_last_change"])
+const OWN_TOOLS = new Set(["read", "replace", "replace_match", "insert", "undo_last_change", "anchor_grep"])
 
 export function stripEchoedAnchors(text: string): { text: string; stripped: number } {
   let stripped = 0
