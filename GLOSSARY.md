@@ -47,3 +47,15 @@ _Avoid_: renombrar, mover atómico
 **Grep de anchors**:
 Búsqueda que solo devuelve anchors ya servidos, sin servir nada nuevo.
 _Avoid_: grep de texto, búsqueda global
+
+**Auto-read**:
+Servido automático de archivos referenciados en el mensaje, sin robar ownership ni reclamar cuota.
+_Avoid_: rastreo, precarga
+
+**Gate**:
+Criterio que deja pasar o frena un auto-servido, siempre con nota motivada.
+_Avoid_: permiso, filtro
+
+**Cuota**:
+Margen libre bajo `maxAnchors`; el auto-read solo sirve si hay margen, nunca reclama.
+_Avoid_: límite, tope

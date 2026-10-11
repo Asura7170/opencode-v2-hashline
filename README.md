@@ -1,10 +1,12 @@
 # opencode-hashline
 
-Hashline plugin for opencode v2 (phase 1: pi-style allocated anchors).
+Hashline plugin for opencode v2 (pi-style allocated anchors).
 
 Tools: `read` (native override, serves `anchor│content` rows) + `replace` +
-`insert` + `undo_last_change`. Same-message same-file edits commit once with
-one undo. Native `edit` inputs get echoed `anchor│` prefixes stripped (with an
+`insert` + `replace_match` + `copy` + `move` + `anchor_grep` (read-only search
+over served anchors) + `undo_last_change`. Same-message same-file edits commit once with
+one undo. Copy/move require the destination served in the same session (no
+served-record inheritance across files or sessions). Native `edit` inputs get echoed `anchor│` prefixes stripped (with an
 `H_ECHO_STRIPPED` notice); native `write` with echoed prefixes fails with
 `E_ANCHOR_ECHO`. `@file` attachments arrive annotated and in-project files
 are editable by anchor without a prior read.
@@ -47,7 +49,7 @@ After editing `opencode.jsonc`, reload the location
 the current tool snapshot; in-flight sessions keep the snapshot from their
 first request.
 
-## Config (no UI in phase 1)
+## Config (file-based, no UI)
 
 File global `<home>/.config/opencode/hashline/config.json`, override per
 project `<project>/.opencode/hashline/config.json`, override per plugin
@@ -75,4 +77,5 @@ relative is resolved against the **project** directory.
 ```sh
 bun test          # entry seam: stable id + setup
 bun run typecheck # tsc --noEmit
+bun run lint      # oxlint src
 ```
