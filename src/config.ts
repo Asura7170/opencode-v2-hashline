@@ -186,6 +186,7 @@ export function withProjectKeys(store: AnchorStore, projectDir: string): AnchorS
     resolve: (filePath, anchor) => store.resolve(keyForFile(projectDir, filePath), anchor),
     resolveRange: (filePath, startAnchor, endAnchor) =>
       store.resolveRange(keyForFile(projectDir, filePath), startAnchor, endAnchor),
+    peek: (filePath) => store.peek(keyForFile(projectDir, filePath)),
     undoShadow: (filePath) => store.undoShadow(keyForFile(projectDir, filePath)),
     restoreShadow: (filePath, diskLines) =>
       store.restoreShadow(keyForFile(projectDir, filePath), diskLines),

@@ -7,6 +7,7 @@ import {
   StaleAnchorError,
   createAnchorStore,
   errorCode,
+  isExcluded,
   type AnchorRow,
   type AnchorStore,
 } from "./anchor-store"
@@ -29,6 +30,7 @@ export interface ToolCallInput {
   content?: unknown
   anchor?: unknown
   position?: unknown
+  pattern?: unknown
 }
 
 export interface ToolCallContext {
@@ -510,6 +512,48 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
   }
 
+  async function grepExecute(rawInput: unknown, context: ToolCallContext) {
+    // Read-only: peek del served-record + disco, nunca serve/commit.
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
+    const { abs, rel } = resolveInProject(projectDir, input?.file)
+    const pattern = input?.pattern
+    if (typeof pattern !== "string" || pattern.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro pattern requerido (string no vacío)")
+    }
+    if (isExcluded(rel, cfg.excludes)) {
+      throw new AnchorStoreError("E_PATH_EXCLUDED", `Path excluido: "${rel}"`)
+    }
+    await readDisk(abs, rel)
+    const store = storeFor(context.sessionID)
+    const served = store.peek(rel)
+    if (!served) {
+      return {
+        content: `H_READ_FIRST: "${rel}" no está servido en esta sesión; usa read para servirlo antes de buscar.`,
+        metadata: { served: false, file: rel, pattern },
+      }
+    }
+    // Literal case-sensitive (como replace_match): sin regex.
+    const matches = served.filter((r) => r.content.includes(pattern))
+    // Mismos topes que read: parseOffset/parseLimit/renderPage sobre matches.
+    const startLine = parseOffset(input?.offset, (anchor) => {
+      const idx = matches.findIndex((r) => r.anchor === anchor)
+      if (idx < 0) {
+        throw new AnchorStoreError(
+          "E_INVALID_INPUT",
+          `offset anchor no está entre las coincidencias: "${anchor}"`,
+        )
+      }
+      return idx + 1
+    })
+    const limit = parseLimit(input?.limit, cfg.maxOutputLines)
+    const page = renderPage(matches, startLine, limit, [], cfg)
+    const lines = [`grep "${pattern}" in ${rel}: ${matches.length} match(es).`, page.text]
+    return {
+      content: lines.join("\n"),
+      metadata: { served: true, file: rel, pattern, totalMatches: matches.length, ...page.metadata },
+    }
+  }
+
   const readDef = {
     name: "read",
     description: "Read a file served as anchor│content rows for stable anchor edits (paginated).",
@@ -563,6 +607,27 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     options: { codemode: false },
     execute: insertExecute,
   }
+  const grepDef = {
+    name: "anchor_grep",
+    description:
+      "Search served anchors for a literal substring (read-only: never serves or mutates).",
+    input: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "Project-relative file path (must be served)." },
+        pattern: { type: "string", description: "Literal case-sensitive substring to find." },
+        offset: {
+          anyOf: [{ type: "number" }, { type: "string" }],
+          description: "1-based match number or anchor to start from.",
+        },
+        limit: { type: "number", description: `Max rows (default ${cfg.maxOutputLines}).` },
+      },
+      required: ["file", "pattern"],
+      additionalProperties: false,
+    },
+    options: { codemode: false },
+    execute: grepExecute,
+  }
   const undoDef = {
     name: "undo_last_change",
     description: "Restore a file to its pre-edit state (single-level per file, persistent).",
@@ -598,6 +663,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     if (!editor.get("replace")) editor.add(replaceDef)
     if (!editor.get("insert")) editor.add(insertDef)
     if (!editor.get("undo_last_change")) editor.add(undoDef)
+    if (!editor.get("anchor_grep")) editor.add(grepDef)
   })
 
   return () => {
