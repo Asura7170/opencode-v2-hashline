@@ -27,6 +27,7 @@ export interface ToolCallInput {
   startAnchor?: unknown
   endAnchor?: unknown
   content?: unknown
+  match?: unknown
   anchor?: unknown
   position?: unknown
 }
@@ -405,6 +406,97 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
   }
 
+  // replace_match (#12): sustitución literal case-sensitive de un Match
+  // servido. Reutiliza tracked/disjoint/commit del Batch como `replace`:
+  // cero o múltiples ocurrencias → E_ANCHOR_MATCH sin escribir (falla
+  // sola, sin abortar el batch).
+  async function replaceMatchExecute(rawInput: unknown, context: ToolCallContext) {
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
+    const { abs, rel } = resolveInProject(projectDir, input?.file)
+    const { match, content } = input ?? {}
+    if (typeof match !== "string" || match.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro match requerido (string no vacío)")
+    }
+    if (typeof content !== "string") {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro content requerido (string)")
+    }
+    const batch = batchFor(context?.sessionID, context?.messageID, rel)
+    assertBatchOpen(batch, rel)
+    const disk = await tracked(batch, rel, () => readDisk(abs, rel))
+    const store = storeFor(context.sessionID)
+    const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk).rows)
+    // Conteo literal case-sensitive sobre lo servido (paso +1: los
+    // solapes también cuentan como ambigüedad).
+    let count = 0
+    let at = disk.indexOf(match)
+    while (at >= 0) {
+      count++
+      at = disk.indexOf(match, at + 1)
+    }
+    if (count !== 1) {
+      throw new AnchorStoreError(
+        "E_ANCHOR_MATCH",
+        count === 0
+          ? `Match no servido en "${rel}": ${JSON.stringify(match.slice(0, 120))} (0 ocurrencias; sin escritura)`
+          : `Match ambiguo en "${rel}": ${JSON.stringify(match.slice(0, 120))} (${count} ocurrencias; sin escritura)`,
+      )
+    }
+    const idx = disk.indexOf(match)
+    const startLine = disk.slice(0, idx).split("\n").length
+    const endLine = disk.slice(0, idx + match.length).split("\n").length
+    const preAnchors = oldRows.slice(startLine - 1, endLine).map((r) => r.anchor)
+    assertDisjoint(batch, rel, preAnchors, `match ${JSON.stringify(match.slice(0, 60))}`)
+    const newContent = disk.slice(0, idx) + content + disk.slice(idx + match.length)
+    if (newContent === disk) {
+      return {
+        content: `H_NOOP: no changes to ${rel} (match already matches).`,
+        metadata: { changed: false, file: rel, startLine, endLine },
+      }
+    }
+    await tracked(batch, rel, async () => {
+      checkNewContent(rel, newContent, cfg.maxFileBytes)
+    })
+    await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
+    const committed = await tracked(batch, rel, () =>
+      // Continuación de batch: un solo undo por mensaje (sombra del primero).
+      Promise.resolve(
+        batch && batch.commits > 0
+          ? store.commit(rel, newContent, { keepShadow: true })
+          : store.commit(rel, newContent),
+      ),
+    )
+    // Rango nuevo = viejo ± delta de líneas: el reintento vía re-lectura
+    // sobre lo creado da E_BATCH_OVERLAP.
+    const newEndLine = endLine + (committed.rows.length - oldRows.length)
+    if (batch) {
+      batch.commits++
+      // Touched = líneas originales + filas nuevas post-commit.
+      for (const a of preAnchors) batch.touched.add(a)
+      for (const r of committed.rows.slice(startLine - 1, newEndLine)) batch.touched.add(r.anchor)
+    }
+    const removed = oldRows.slice(startLine - 1, endLine).map((r) => `- ${formatRow(r, cfg.maxLineChars)}`)
+    const added = committed.rows
+      .slice(startLine - 1, newEndLine)
+      .map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`)
+    const lines = [
+      `replace_match ${rel} lines ${startLine}-${endLine} (match ${JSON.stringify(match.slice(0, 60))}):`,
+      ...removed,
+      ...added,
+      `${committed.rows.length} lines total.`,
+      ...formatWarnings(committed.warnings),
+    ]
+    return {
+      content: lines.join("\n"),
+      metadata: {
+        changed: true,
+        file: rel,
+        startLine,
+        endLine: newEndLine,
+        totalLines: committed.rows.length,
+      },
+    }
+  }
+
   async function insertExecute(rawInput: unknown, context: ToolCallContext) {
     const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
@@ -546,6 +638,25 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     options: { codemode: false },
     execute: replaceExecute,
   }
+  const replaceMatchDef = {
+    name: "replace_match",
+    description: "Replace a single literal match of served text (verified against served-record).",
+    input: {
+      type: "object",
+      properties: {
+        file: { type: "string" },
+        match: {
+          type: "string",
+          description: "Literal case-sensitive text to replace (exactly one occurrence in served content).",
+        },
+        content: { type: "string", description: "Replacement text." },
+      },
+      required: ["file", "match", "content"],
+      additionalProperties: false,
+    },
+    options: { codemode: false },
+    execute: replaceMatchExecute,
+  }
   const insertDef = {
     name: "insert",
     description: "Insert text before/after an anchor (verified against served-record).",
@@ -596,6 +707,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       editor.add(readDef)
     }
     if (!editor.get("replace")) editor.add(replaceDef)
+    if (!editor.get("replace_match")) editor.add(replaceMatchDef)
     if (!editor.get("insert")) editor.add(insertDef)
     if (!editor.get("undo_last_change")) editor.add(undoDef)
   })
