@@ -10,6 +10,8 @@ import {
   isExcluded,
   type AnchorRow,
   type AnchorStore,
+  type ResolvedAnchor,
+  type ServeResult,
 } from "./anchor-store"
 
 import {
@@ -571,6 +573,49 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
   }
 
+  // Camino de commit a destino compartido por copy (#13) y move (#15):
+  // serve + resolve del punto, foto, cómputo, pre-escritura, write y commit.
+  // Sin marcado de batch: cada llamador marca al final (move vacía el
+  // origen entre el commit y el marcado sin auto-solaparse).
+  async function commitDestCopy(
+    store: AnchorStore,
+    batchDst: BatchState | null,
+    dstAbs: string,
+    dstRel: string,
+    destAnchor: string,
+    position: "before" | "after",
+    srcLines: string[],
+  ): Promise<{ committed: ServeResult; dstResolved: ResolvedAnchor; idx: number }> {
+    const dstDisk = await tracked(batchDst, dstRel, () => readDisk(dstAbs, dstRel))
+    await tracked(batchDst, dstRel, async () => {
+      store.serve(dstRel, dstDisk)
+    })
+    // Pre-commit: re-copiar sobre el mismo punto de destino es solape.
+    assertDisjoint(batchDst, dstRel, [destAnchor], `destino en "${destAnchor}"`)
+    let dstResolved: ResolvedAnchor
+    try {
+      dstResolved = store.resolve(dstRel, destAnchor)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
+    const dstLines = splitLines(dstDisk)
+    const idx = position === "before" ? dstResolved.line - 1 : dstResolved.line
+    const newContent = [...dstLines.slice(0, idx), ...srcLines, ...dstLines.slice(idx)].join("\n")
+    await tracked(batchDst, dstRel, async () => {
+      checkNewContent(dstRel, newContent, cfg.maxFileBytes)
+    })
+    await tracked(batchDst, dstRel, () => writeFile(dstAbs, newContent, "utf-8"))
+    const committed = await tracked(batchDst, dstRel, () =>
+      Promise.resolve(
+        batchDst && batchDst.commits > 0
+          ? store.commit(dstRel, newContent, { keepShadow: true })
+          : store.commit(dstRel, newContent),
+      ),
+    )
+    return { committed, dstResolved, idx }
+  }
+
   // Copy #13: replica líneas servidas del origen en un destino ya servido
   // de la misma sesión. El origen solo se trackea en su batch (sin commit:
   // su undo queda vacío); el destino commitea como un insert (keepShadow en
@@ -625,36 +670,19 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       preAnchors,
       `copy origen ${startAnchor}-${endAnchor ?? startAnchor}`,
     )
-    const dstDisk = await tracked(batchDst, dstRel, () => readDisk(dstAbs, dstRel))
-    await tracked(batchDst, dstRel, async () => {
-      store.serve(dstRel, dstDisk)
-    })
-    // Pre-commit: re-copiar sobre el mismo punto de destino es solape.
-    assertDisjoint(batchDst, dstRel, [destAnchor], `copy destino en "${destAnchor}"`)
-    let dstResolved
-    try {
-      dstResolved = store.resolve(dstRel, destAnchor)
-    } catch (err) {
-      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
-      throw err
-    }
     // Foto pre-escritura: el mismo-archivo copia duplicando, nunca mezcla.
     const srcLines = splitLines(srcDisk).slice(srcRange.startLine - 1, srcRange.endLine)
-    const dstLines = splitLines(dstDisk)
-    const idx = position === "before" ? dstResolved.line - 1 : dstResolved.line
-    const newContent = [...dstLines.slice(0, idx), ...srcLines, ...dstLines.slice(idx)].join("\n")
-    await tracked(batchDst, dstRel, async () => {
-      checkNewContent(dstRel, newContent, cfg.maxFileBytes)
-    })
-    await tracked(batchDst, dstRel, () => writeFile(dstAbs, newContent, "utf-8"))
-    const committed = await tracked(batchDst, dstRel, () =>
-      Promise.resolve(
-        batchDst && batchDst.commits > 0
-          ? store.commit(dstRel, newContent, { keepShadow: true })
-          : store.commit(dstRel, newContent),
-      ),
+    // Commit a destino por el camino compartido con move (#15).
+    const { committed, dstResolved, idx } = await commitDestCopy(
+      store,
+      batchDst,
+      dstAbs,
+      dstRel,
+      destAnchor,
+      position,
+      srcLines,
     )
-    // Marcado al final: move (#14) vacía el origen entre el commit de destino
+    // Marcado al final: move (#15) vacía el origen entre el commit de destino
     // y este marcado sin auto-solaparse.
     if (batchDst) {
       batchDst.commits++
@@ -683,6 +711,187 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
         endLine: srcRange.endLine,
         line: dstResolved.line,
         totalLines: committed.rows.length,
+      },
+    }
+  }
+
+  // Move #15: destino-primero — el destino commitea por el camino de copy y
+  // solo entonces se vacía el origen en el mismo mensaje. Fallo en destino
+  // → origen intacto. Un batch y un undo por archivo: sin undo atómico
+  // cross-file (decisión de spec, no deuda).
+  async function moveExecute(rawInput: unknown, context: ToolCallContext) {
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
+    const { abs: srcAbs, rel: srcRel } = resolveInProject(projectDir, input?.file)
+    const { abs: dstAbs, rel: dstRel } = resolveInProject(projectDir, input?.destFile)
+    const { startAnchor, endAnchor, destAnchor, position } = input ?? {}
+    if (typeof startAnchor !== "string" || startAnchor.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro startAnchor requerido")
+    }
+    if (endAnchor !== undefined && (typeof endAnchor !== "string" || endAnchor.length === 0)) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro endAnchor inválido")
+    }
+    if (typeof destAnchor !== "string" || destAnchor.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro destAnchor requerido")
+    }
+    if (position !== "before" && position !== "after") {
+      throw new AnchorStoreError(
+        "E_INVALID_INPUT",
+        `position debe ser "before" o "after": ${JSON.stringify(position)}`,
+      )
+    }
+    const batchSrc = batchFor(context?.sessionID, context?.messageID, srcRel)
+    const batchDst = batchFor(context?.sessionID, context?.messageID, dstRel)
+    assertBatchOpen(batchSrc, srcRel)
+    if (batchDst !== batchSrc) assertBatchOpen(batchDst, dstRel)
+    const srcDisk = await tracked(batchSrc, srcRel, () => readDisk(srcAbs, srcRel))
+    const store = storeFor(context.sessionID)
+    const srcRows = await tracked(batchSrc, srcRel, async () => store.serve(srcRel, srcDisk).rows)
+    assertDisjoint(
+      batchSrc,
+      srcRel,
+      [startAnchor, endAnchor ?? startAnchor],
+      `move origen ${startAnchor}-${endAnchor ?? startAnchor}`,
+    )
+    let srcRange
+    try {
+      srcRange = store.resolveRange(srcRel, startAnchor, endAnchor ?? startAnchor)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
+    const preAnchors = srcRows.slice(srcRange.startLine - 1, srcRange.endLine).map((r) => r.anchor)
+    assertDisjoint(
+      batchSrc,
+      srcRel,
+      preAnchors,
+      `move origen ${startAnchor}-${endAnchor ?? startAnchor}`,
+    )
+    const srcLines = splitLines(srcDisk).slice(srcRange.startLine - 1, srcRange.endLine)
+
+    if (srcRel === dstRel) {
+      // Mismo archivo: quitar-y-poner en un solo commit (un batch, un undo).
+      // En dos pasos corrompería: tras insertar la copia los anchors viejos
+      // realinean sobre ambas y el vaciado se comería lo recién insertado.
+      assertDisjoint(batchSrc, srcRel, [destAnchor], `move destino en "${destAnchor}"`)
+      let dstResolved: ResolvedAnchor
+      try {
+        dstResolved = store.resolve(srcRel, destAnchor)
+      } catch (err) {
+        if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+        throw err
+      }
+      const all = splitLines(srcDisk)
+      const n = srcLines.length
+      const idx = position === "before" ? dstResolved.line - 1 : dstResolved.line
+      // Punto de inserción tras quitar el rango: antes, después o dentro
+      // (dentro del rango = identidad).
+      const at =
+        idx <= srcRange.startLine - 1
+          ? idx
+          : idx >= srcRange.endLine
+            ? idx - n
+            : srcRange.startLine - 1
+      const rest = [...all.slice(0, srcRange.startLine - 1), ...all.slice(srcRange.endLine)]
+      const newContent = [...rest.slice(0, at), ...srcLines, ...rest.slice(at)].join("\n")
+      if (newContent === srcDisk) {
+        return {
+          content: `H_NOOP: no changes to ${srcRel} (move already in place).`,
+          metadata: {
+            changed: false,
+            file: srcRel,
+            startLine: srcRange.startLine,
+            endLine: srcRange.endLine,
+          },
+        }
+      }
+      await tracked(batchSrc, srcRel, async () => {
+        checkNewContent(srcRel, newContent, cfg.maxFileBytes)
+      })
+      await tracked(batchSrc, srcRel, () => writeFile(srcAbs, newContent, "utf-8"))
+      const committed = await tracked(batchSrc, srcRel, () =>
+        Promise.resolve(
+          batchSrc && batchSrc.commits > 0
+            ? store.commit(srcRel, newContent, { keepShadow: true })
+            : store.commit(srcRel, newContent),
+        ),
+      )
+      if (batchSrc) {
+        batchSrc.commits++
+        for (const a of preAnchors) batchSrc.touched.add(a)
+        batchSrc.touched.add(destAnchor)
+        for (const r of committed.rows.slice(at, at + n)) batchSrc.touched.add(r.anchor)
+      }
+      const added = committed.rows.slice(at, at + n).map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`)
+      const lines = [
+        `move ${srcRel} lines ${srcRange.startLine}-${srcRange.endLine} (anchors ${startAnchor}-${endAnchor ?? startAnchor}) ${position} anchor ${destAnchor} (line ${dstResolved.line}):`,
+        ...added,
+        `${committed.rows.length} lines total.`,
+        ...formatWarnings(committed.warnings),
+      ]
+      return {
+        content: lines.join("\n"),
+        metadata: {
+          changed: true,
+          file: srcRel,
+          sourceFile: srcRel,
+          startLine: srcRange.startLine,
+          endLine: srcRange.endLine,
+          line: dstResolved.line,
+          totalLines: committed.rows.length,
+        },
+      }
+    }
+
+    // Dos archivos: el destino commitea PRIMERO por el camino de copy; el
+    // origen se vacía solo entonces, en el mismo mensaje.
+    const dest = await commitDestCopy(store, batchDst, dstAbs, dstRel, destAnchor, position, srcLines)
+    const { committed, dstResolved, idx } = dest
+    // Vaciado del origen ANTES del marcado de preAnchors (aviso #13): toca el
+    // mismo rango a propósito y bypassea disjoint (ya verificado arriba).
+    // Subconjunto del contenido: sin checkNewContent (solo encoge).
+    const emptied = [
+      ...splitLines(srcDisk).slice(0, srcRange.startLine - 1),
+      ...splitLines(srcDisk).slice(srcRange.endLine),
+    ].join("\n")
+    await tracked(batchSrc, srcRel, () => writeFile(srcAbs, emptied, "utf-8"))
+    const srcCommitted = await tracked(batchSrc, srcRel, () =>
+      Promise.resolve(
+        batchSrc && batchSrc.commits > 0
+          ? store.commit(srcRel, emptied, { keepShadow: true })
+          : store.commit(srcRel, emptied),
+      ),
+    )
+    if (batchDst) {
+      batchDst.commits++
+      batchDst.touched.add(destAnchor)
+      for (const r of committed.rows.slice(idx, idx + srcLines.length))
+        batchDst.touched.add(r.anchor)
+    }
+    if (batchSrc) {
+      batchSrc.commits++
+      for (const a of preAnchors) batchSrc.touched.add(a)
+    }
+    const added = committed.rows
+      .slice(idx, idx + srcLines.length)
+      .map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`)
+    const lines = [
+      `move ${srcRel} lines ${srcRange.startLine}-${srcRange.endLine} (anchors ${startAnchor}-${endAnchor ?? startAnchor}) ${position} ${dstRel} anchor ${destAnchor} (line ${dstResolved.line}):`,
+      ...added,
+      `${dstRel}: ${committed.rows.length} lines total; ${srcRel}: ${srcCommitted.rows.length} lines total.`,
+      ...formatWarnings(committed.warnings),
+      ...formatWarnings(srcCommitted.warnings),
+    ]
+    return {
+      content: lines.join("\n"),
+      metadata: {
+        changed: true,
+        file: dstRel,
+        sourceFile: srcRel,
+        startLine: srcRange.startLine,
+        endLine: srcRange.endLine,
+        line: dstResolved.line,
+        totalLines: committed.rows.length,
+        sourceTotalLines: srcCommitted.rows.length,
       },
     }
   }
@@ -855,6 +1064,26 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     options: { codemode: false },
     execute: copyExecute,
   }
+  const moveDef = {
+    name: "move",
+    description:
+      "Move served lines to an already-served destination, emptying the source only after the destination commits (verified against served-record).",
+    input: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "Project-relative source file path." },
+        startAnchor: { type: "string" },
+        endAnchor: { type: "string" },
+        destFile: { type: "string", description: "Project-relative destination file path (already served)." },
+        destAnchor: { type: "string" },
+        position: { type: "string", enum: ["before", "after"] },
+      },
+      required: ["file", "startAnchor", "destFile", "destAnchor", "position"],
+      additionalProperties: false,
+    },
+    options: { codemode: false },
+    execute: moveExecute,
+  }
   const grepDef = {
     name: "anchor_grep",
     description:
@@ -912,6 +1141,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     if (!editor.get("replace_match")) editor.add(replaceMatchDef)
     if (!editor.get("insert")) editor.add(insertDef)
     if (!editor.get("copy")) editor.add(copyDef)
+    if (!editor.get("move")) editor.add(moveDef)
     if (!editor.get("undo_last_change")) editor.add(undoDef)
     if (!editor.get("anchor_grep")) editor.add(grepDef)
   })

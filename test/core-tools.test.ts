@@ -362,6 +362,7 @@ describe("t10 contrato de registro con el host (e2e 2.0.26)", () => {
       "replace_match",
       "insert",
       "copy",
+      "move",
       "undo_last_change",
       "anchor_grep",
     ]) {
