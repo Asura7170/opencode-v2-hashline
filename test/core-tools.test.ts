@@ -356,7 +356,7 @@ describe("t10 contrato de registro con el host (e2e 2.0.26)", () => {
     const dir = project()
     writeFileSync(join(dir, "a.txt"), "one")
     const { tools, cleanup } = await setup(dir)
-    for (const name of ["read", "replace", "insert", "undo_last_change"]) {
+    for (const name of ["read", "replace", "replace_match", "insert", "undo_last_change"]) {
       expect(tools.get(name)?.options).toEqual({ codemode: false })
     }
     await cleanup?.()
