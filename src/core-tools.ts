@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs"
 import { readFile, writeFile } from "node:fs/promises"
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path"
 
 import {
   AnchorStoreError,
@@ -52,7 +52,6 @@ export interface CoreToolsHost {
 export const MAX_OUTPUT_LINES = DEFAULT_CONFIG.maxOutputLines
 export const MAX_OUTPUT_BYTES = DEFAULT_CONFIG.maxOutputBytes
 export const MAX_LINE_CHARS = DEFAULT_CONFIG.maxLineChars
-const MAX_FILE_BYTES = DEFAULT_CONFIG.maxFileBytes
 
 function splitLines(content: string): string[] {
   return content.replace(/\r\n/g, "\n").split("\n")
@@ -495,7 +494,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     // abre un nivel de undo fresco.
     const sessionID = context?.sessionID
     if (typeof sessionID === "string") {
-      for (const key of [...batches.keys()]) {
+      for (const key of batches.keys()) {
         if (key.startsWith(`${sessionID}\n`) && key.endsWith(`\n${rel}`)) batches.delete(key)
       }
     }

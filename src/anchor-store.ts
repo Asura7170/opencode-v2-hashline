@@ -246,7 +246,7 @@ export function createAnchorStore(opts: AnchorStoreOptions): AnchorStore {
       if (q) q.push(i)
       else queues.set(l.content, [i])
     })
-    const taken = new Array<boolean>(old.length).fill(false)
+    const taken = Array.from({ length: old.length }, () => false)
     let last = -1
     return contents.map((content) => {
       const q = queues.get(content) ?? []
