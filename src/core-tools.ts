@@ -29,6 +29,8 @@ export interface ToolCallInput {
   content?: unknown
   anchor?: unknown
   position?: unknown
+  destFile?: unknown
+  destAnchor?: unknown
 }
 
 export interface ToolCallContext {
@@ -475,6 +477,122 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
   }
 
+  // Copy #13: replica líneas servidas del origen en un destino ya servido
+  // de la misma sesión. El origen solo se trackea en su batch (sin commit:
+  // su undo queda vacío); el destino commitea como un insert (keepShadow en
+  // continuación). Sin herencia: las copiadas realinean anchors del destino.
+  async function copyExecute(rawInput: unknown, context: ToolCallContext) {
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
+    const { abs: srcAbs, rel: srcRel } = resolveInProject(projectDir, input?.file)
+    const { abs: dstAbs, rel: dstRel } = resolveInProject(projectDir, input?.destFile)
+    const { startAnchor, endAnchor, destAnchor, position } = input ?? {}
+    if (typeof startAnchor !== "string" || startAnchor.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro startAnchor requerido")
+    }
+    if (endAnchor !== undefined && (typeof endAnchor !== "string" || endAnchor.length === 0)) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro endAnchor inválido")
+    }
+    if (typeof destAnchor !== "string" || destAnchor.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro destAnchor requerido")
+    }
+    if (position !== "before" && position !== "after") {
+      throw new AnchorStoreError(
+        "E_INVALID_INPUT",
+        `position debe ser "before" o "after": ${JSON.stringify(position)}`,
+      )
+    }
+    // Un batch por lado (misma clave si origen y destino coinciden): el undo
+    // de cada archivo sigue funcionando por separado.
+    const batchSrc = batchFor(context?.sessionID, context?.messageID, srcRel)
+    const batchDst = batchFor(context?.sessionID, context?.messageID, dstRel)
+    assertBatchOpen(batchSrc, srcRel)
+    if (batchDst !== batchSrc) assertBatchOpen(batchDst, dstRel)
+    const srcDisk = await tracked(batchSrc, srcRel, () => readDisk(srcAbs, srcRel))
+    const store = storeFor(context.sessionID)
+    const srcRows = await tracked(batchSrc, srcRel, async () => store.serve(srcRel, srcDisk).rows)
+    // Pre-commit: re-copiar el mismo rango del batch es solape, no stale.
+    assertDisjoint(
+      batchSrc,
+      srcRel,
+      [startAnchor, endAnchor ?? startAnchor],
+      `copy origen ${startAnchor}-${endAnchor ?? startAnchor}`,
+    )
+    let srcRange
+    try {
+      srcRange = store.resolveRange(srcRel, startAnchor, endAnchor ?? startAnchor)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
+    const preAnchors = srcRows.slice(srcRange.startLine - 1, srcRange.endLine).map((r) => r.anchor)
+    assertDisjoint(
+      batchSrc,
+      srcRel,
+      preAnchors,
+      `copy origen ${startAnchor}-${endAnchor ?? startAnchor}`,
+    )
+    const dstDisk = await tracked(batchDst, dstRel, () => readDisk(dstAbs, dstRel))
+    await tracked(batchDst, dstRel, async () => {
+      store.serve(dstRel, dstDisk)
+    })
+    // Pre-commit: re-copiar sobre el mismo punto de destino es solape.
+    assertDisjoint(batchDst, dstRel, [destAnchor], `copy destino en "${destAnchor}"`)
+    let dstResolved
+    try {
+      dstResolved = store.resolve(dstRel, destAnchor)
+    } catch (err) {
+      if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
+      throw err
+    }
+    // Foto pre-escritura: el mismo-archivo copia duplicando, nunca mezcla.
+    const srcLines = splitLines(srcDisk).slice(srcRange.startLine - 1, srcRange.endLine)
+    const dstLines = splitLines(dstDisk)
+    const idx = position === "before" ? dstResolved.line - 1 : dstResolved.line
+    const newContent = [...dstLines.slice(0, idx), ...srcLines, ...dstLines.slice(idx)].join("\n")
+    await tracked(batchDst, dstRel, async () => {
+      checkNewContent(dstRel, newContent, cfg.maxFileBytes)
+    })
+    await tracked(batchDst, dstRel, () => writeFile(dstAbs, newContent, "utf-8"))
+    const committed = await tracked(batchDst, dstRel, () =>
+      Promise.resolve(
+        batchDst && batchDst.commits > 0
+          ? store.commit(dstRel, newContent, { keepShadow: true })
+          : store.commit(dstRel, newContent),
+      ),
+    )
+    // Marcado al final: move (#14) vacía el origen entre el commit de destino
+    // y este marcado sin auto-solaparse.
+    if (batchDst) {
+      batchDst.commits++
+      batchDst.touched.add(destAnchor)
+      for (const r of committed.rows.slice(idx, idx + srcLines.length)) batchDst.touched.add(r.anchor)
+    }
+    if (batchSrc) {
+      for (const a of preAnchors) batchSrc.touched.add(a)
+    }
+    const added = committed.rows
+      .slice(idx, idx + srcLines.length)
+      .map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`)
+    const lines = [
+      `copy ${srcRel} lines ${srcRange.startLine}-${srcRange.endLine} (anchors ${startAnchor}-${endAnchor ?? startAnchor}) ${position} ${dstRel} anchor ${destAnchor} (line ${dstResolved.line}):`,
+      ...added,
+      `${committed.rows.length} lines total.`,
+      ...formatWarnings(committed.warnings),
+    ]
+    return {
+      content: lines.join("\n"),
+      metadata: {
+        changed: true,
+        file: dstRel,
+        sourceFile: srcRel,
+        startLine: srcRange.startLine,
+        endLine: srcRange.endLine,
+        line: dstResolved.line,
+        totalLines: committed.rows.length,
+      },
+    }
+  }
+
   async function undoExecute(rawInput: unknown, context: ToolCallContext) {
     const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
@@ -563,6 +681,25 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     options: { codemode: false },
     execute: insertExecute,
   }
+  const copyDef = {
+    name: "copy",
+    description: "Copy served lines to an already-served destination (verified against served-record).",
+    input: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "Project-relative source file path." },
+        startAnchor: { type: "string" },
+        endAnchor: { type: "string" },
+        destFile: { type: "string", description: "Project-relative destination file path (already served)." },
+        destAnchor: { type: "string" },
+        position: { type: "string", enum: ["before", "after"] },
+      },
+      required: ["file", "startAnchor", "destFile", "destAnchor", "position"],
+      additionalProperties: false,
+    },
+    options: { codemode: false },
+    execute: copyExecute,
+  }
   const undoDef = {
     name: "undo_last_change",
     description: "Restore a file to its pre-edit state (single-level per file, persistent).",
@@ -597,6 +734,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
     if (!editor.get("replace")) editor.add(replaceDef)
     if (!editor.get("insert")) editor.add(insertDef)
+    if (!editor.get("copy")) editor.add(copyDef)
     if (!editor.get("undo_last_change")) editor.add(undoDef)
   })
 
