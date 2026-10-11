@@ -27,6 +27,36 @@ export const SYSTEM_PROMPT = [
   "Stale anchors fail with E_ANCHOR_STALE plus current rows: re-read and retry. Identical rewrites report H_NOOP without writing.",
 ].join("\n")
 
+// Host mínimo que usan las guardas: tolera stubs parciales (tests) y el
+// Context real del plugin. Los callbacks infieren sus eventos de aquí,
+// no de `any`.
+export interface GuardToolEvent {
+  tool?: unknown
+  input?: unknown
+  id?: unknown
+  status?: unknown
+  result?: unknown
+}
+
+export interface GuardSessionInput {
+  system?: unknown
+}
+
+export interface GuardHost {
+  tool?: {
+    hook: (
+      name: "execute.before" | "execute.after",
+      cb: (ev: GuardToolEvent) => void | Promise<void>,
+    ) => Promise<{ dispose: () => Promise<void> }>
+  }
+  session?: {
+    hook: (
+      name: "context",
+      cb: (input: GuardSessionInput) => void | Promise<void>,
+    ) => Promise<{ dispose: () => Promise<void> }>
+  }
+}
+
 // Tools propias: el wrapper codemode `execute` también dispara hooks,
 // así que se omiten por nombre (además el strip ya es idempotente).
 const OWN_TOOLS = new Set(["read", "replace", "insert", "undo_last_change"])
@@ -116,16 +146,21 @@ function countEchoesInInput(input: unknown): number {
   return n
 }
 
-export async function registerNativeGuards(ctx: any): Promise<() => void> {
+export async function registerNativeGuards(ctx: GuardHost): Promise<() => void> {
   const disposers: { dispose: () => Promise<void> }[] = []
   // id de call → ecos limpiados en before, para avisar en after.
   const pending = new Map<string, number>()
 
   if (ctx.tool?.hook) {
     disposers.push(
-      await ctx.tool.hook("execute.before", (ev: any) => {
+      await ctx.tool.hook("execute.before", (ev) => {
         // El refusal debe atravesar: se decide fuera del try que protege al host.
-        if (!OWN_TOOLS.has(ev?.tool) && ev?.tool === "write" && hasEchoesInInput(ev?.input)) {
+        if (
+          typeof ev?.tool === "string" &&
+          !OWN_TOOLS.has(ev.tool) &&
+          ev.tool === "write" &&
+          hasEchoesInInput(ev?.input)
+        ) {
           const n = countEchoesInInput(ev.input)
           throw new AnchorStoreError(
             "E_ANCHOR_ECHO",
@@ -134,7 +169,7 @@ export async function registerNativeGuards(ctx: any): Promise<() => void> {
           )
         }
         try {
-          if (OWN_TOOLS.has(ev?.tool) || ev?.tool !== "edit") return
+          if (typeof ev?.tool !== "string" || OWN_TOOLS.has(ev.tool) || ev.tool !== "edit") return
           const n = stripEchoesInInput(ev?.input)
           if (n > 0 && typeof ev?.id === "string") {
             pending.set(ev.id, (pending.get(ev.id) ?? 0) + n)
@@ -147,7 +182,7 @@ export async function registerNativeGuards(ctx: any): Promise<() => void> {
     disposers.push(
       // Post-edit solo avisa strips propios: no anota lecturas (el override
       // de `read` ya sirve anchors; #6).
-      await ctx.tool.hook("execute.after", (ev: any) => {
+      await ctx.tool.hook("execute.after", (ev) => {
         try {
           const n = typeof ev?.id === "string" ? pending.get(ev.id) : undefined
           if (typeof ev?.id === "string") pending.delete(ev.id)
@@ -170,13 +205,18 @@ export async function registerNativeGuards(ctx: any): Promise<() => void> {
 
   if (ctx.session?.hook) {
     disposers.push(
-      await ctx.session.hook("context", (input: any) => {
+      await ctx.session.hook("context", (input) => {
         try {
           const sys = input?.system
           if (!Array.isArray(sys)) return
           if (
             sys.some(
-              (p: any) => typeof p?.text === "string" && p.text.includes(SYSTEM_PROMPT_MARKER),
+              (p: unknown) =>
+                typeof p === "object" &&
+                p !== null &&
+                "text" in p &&
+                typeof p.text === "string" &&
+                p.text.includes(SYSTEM_PROMPT_MARKER),
             )
           ) {
             return

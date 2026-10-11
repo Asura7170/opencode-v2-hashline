@@ -25,6 +25,22 @@ export class AnchorStoreError extends Error {
   }
 }
 
+/** Fila cruda de la tabla files (bun:sqlite devuelve unknown). */
+interface FileRow {
+  path: string
+  owner: string
+  anchors: string
+  prev: string | null
+  seq: number
+  dirty: number
+}
+
+/** Código de error del SO (ENOENT, EISDIR…) sin `any`. */
+export function errorCode(err: unknown): string | undefined {
+  const code = (err as { code?: unknown } | null)?.code
+  return typeof code === "string" ? code : undefined
+}
+
 export class StaleAnchorError extends AnchorStoreError {
   readonly rows: AnchorRow[]
   constructor(message: string, rows: AnchorRow[]) {
@@ -157,7 +173,7 @@ export function createAnchorStore(opts: AnchorStoreOptions): AnchorStore {
   let clock = 0
   for (const row of db
     .query("SELECT path, owner, anchors, prev, seq, dirty FROM files")
-    .all() as any[]) {
+    .all() as FileRow[]) {
     const lines = JSON.parse(row.anchors) as LineAlloc[]
     files.set(row.path, {
       owner: row.owner,

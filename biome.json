@@ -1,0 +1,12 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.0/biome.json",
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "suspicious": {
+        "noExplicitAny": "error"
+      }
+    }
+  }
+}

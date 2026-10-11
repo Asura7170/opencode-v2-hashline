@@ -6,6 +6,7 @@ import {
   AnchorStoreError,
   StaleAnchorError,
   createAnchorStore,
+  errorCode,
   type AnchorRow,
   type AnchorStore,
 } from "./anchor-store"
@@ -16,6 +17,35 @@ import {
   storePathFor as configStorePathFor,
   type HashlineConfig,
 } from "./config"
+import type { ToolEditor } from "@opencode/plugin/promise/tool"
+
+// Entrada/salida de los execute: campos validados uno por uno (nunca `any`).
+export interface ToolCallInput {
+  file?: unknown
+  offset?: unknown
+  limit?: unknown
+  startAnchor?: unknown
+  endAnchor?: unknown
+  content?: unknown
+  anchor?: unknown
+  position?: unknown
+}
+
+export interface ToolCallContext {
+  sessionID: string
+  messageID?: string
+  signal?: AbortSignal
+}
+
+// Host mínimo que usa el registro: tolera stubs parciales (tests) y el
+// Context real del plugin. El editor se tipa con ToolEditor del host.
+export interface CoreToolsHost {
+  location: { project: { directory: string } }
+  options: unknown
+  tool: {
+    transform: (cb: (editor: ToolEditor) => void) => Promise<unknown>
+  }
+}
 
 // Defaults del spec (ticket #9): los gobierna la config
 // (global < proyecto < opciones); aquí solo quedan como re-export estable.
@@ -162,11 +192,11 @@ function parseLimit(limit: unknown, maxOutputLines: number): number {
 async function readDisk(abs: string, rel: string): Promise<string> {
   try {
     return await readFile(abs, "utf-8")
-  } catch (err: any) {
-    if (err?.code === "ENOENT") {
+  } catch (err) {
+    if (errorCode(err) === "ENOENT") {
       throw new AnchorStoreError("E_FILE_NOT_FOUND", `No existe: "${rel}"`)
     }
-    if (err?.code === "EISDIR") {
+    if (errorCode(err) === "EISDIR") {
       throw new AnchorStoreError("E_INVALID_INPUT", `No es un archivo: "${rel}"`)
     }
     throw err
@@ -180,7 +210,7 @@ export interface CoreToolsDeps {
   storeFor?: (sessionID: string) => AnchorStore
 }
 
-export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise<() => void> {
+export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps): Promise<() => void> {
   const projectDir: string = ctx.location.project.directory
   const cfg = deps?.config ?? (await loadHashlineConfig({ projectDir, options: ctx.options }))
   const stores = new Map<string, AnchorStore>()
@@ -212,15 +242,15 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
   async function tracked<T>(batch: BatchState | null, rel: string, fn: () => Promise<T>): Promise<T> {
     try {
       return await fn()
-    } catch (err: any) {
-      if (batch) batch.aborted = typeof err?.code === "string" ? err.code : "E_FILE_WRITE"
+    } catch (err) {
+      if (batch) batch.aborted = errorCode(err) ?? "E_FILE_WRITE"
       if (err instanceof AnchorStoreError) {
         err.message += ` (H_BATCH_ABORTED: batch para "${rel}" abortado)`
         throw err
       }
       throw new AnchorStoreError(
         "E_FILE_WRITE",
-        `No se pudo escribir "${rel}": ${err?.message ?? String(err)} (H_BATCH_ABORTED: batch para "${rel}" abortado)`,
+        `No se pudo escribir "${rel}": ${err instanceof Error ? err.message : String(err)} (H_BATCH_ABORTED: batch para "${rel}" abortado)`,
       )
     }
   }
@@ -259,7 +289,9 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
 
   const storeFor = deps?.storeFor ?? ownStoreFor
 
-  async function readExecute(input: any, context: any) {
+  async function readExecute(rawInput: unknown, context: ToolCallContext) {
+    // El host valida contra el JSON schema; aquí se valida campo por campo.
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
     const disk = await readDisk(abs, rel)
     const store = storeFor(context.sessionID)
@@ -276,7 +308,8 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     return { content: page.text, metadata: page.metadata }
   }
 
-  async function replaceExecute(input: any, context: any) {
+  async function replaceExecute(rawInput: unknown, context: ToolCallContext) {
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
     const { startAnchor, endAnchor, content } = input ?? {}
     if (typeof startAnchor !== "string" || startAnchor.length === 0) {
@@ -373,7 +406,8 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     }
   }
 
-  async function insertExecute(input: any, context: any) {
+  async function insertExecute(rawInput: unknown, context: ToolCallContext) {
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
     const { anchor, position, content } = input ?? {}
     if (typeof anchor !== "string" || anchor.length === 0) {
@@ -442,12 +476,13 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     }
   }
 
-  async function undoExecute(input: any, context: any) {
+  async function undoExecute(rawInput: unknown, context: ToolCallContext) {
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
     let diskLines: string[] | null
     try {
       diskLines = splitLines(await readDisk(abs, rel))
-    } catch (err: any) {
+    } catch (err) {
       // Archivo borrado tras el edit: se recrea desde la sombra.
       if (err instanceof AnchorStoreError && err.code === "E_FILE_NOT_FOUND") diskLines = null
       else throw err
@@ -546,9 +581,9 @@ export async function registerCoreTools(ctx: any, deps?: CoreToolsDeps): Promise
     execute: undoExecute,
   }
 
-  await ctx.tool.transform((editor: any) => {
+  await ctx.tool.transform((editor) => {
     if (editor.get("read")) {
-      editor.update("read", (tool: any) => {
+      editor.update("read", (tool) => {
         tool.description = readDef.description
         tool.input = readDef.input
         tool.execute = readExecute

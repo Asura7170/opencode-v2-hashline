@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 
-import { DEFAULT_EXCLUDES, type AnchorStore } from "./anchor-store"
+import { DEFAULT_EXCLUDES, errorCode, type AnchorStore } from "./anchor-store"
 
 // Config sin UI (ticket #9, historia 16 del spec):
 // archivo global < archivo de proyecto < opciones del plugin (ctx.options),
@@ -128,9 +128,9 @@ async function loadLayer(path: string, where: string): Promise<Partial<HashlineC
   let raw: string
   try {
     raw = await readFile(path, "utf-8")
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return {}
-    throw new ConfigError(`no se pudo leer ${where} (${path}): ${err?.message ?? err}`)
+  } catch (err) {
+    if (errorCode(err) === "ENOENT") return {}
+    throw new ConfigError(`no se pudo leer ${where} (${path}): ${err instanceof Error ? err.message : String(err)}`)
   }
   let parsed: unknown
   try {

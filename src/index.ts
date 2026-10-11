@@ -15,7 +15,14 @@ import {
 import { registerCoreTools } from "./core-tools"
 import { registerNativeGuards } from "./native-guards"
 
-function projectDirOf(ctx: any): string | null {
+interface LocationLike {
+  location?: {
+    project?: { directory?: unknown }
+    directory?: unknown
+  }
+}
+
+function projectDirOf(ctx: LocationLike): string | null {
   const dir = ctx.location?.project?.directory ?? ctx.location?.directory
   return typeof dir === "string" && dir !== "" ? dir : null
 }
