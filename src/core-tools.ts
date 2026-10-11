@@ -7,6 +7,7 @@ import {
   StaleAnchorError,
   createAnchorStore,
   errorCode,
+  isExcluded,
   type AnchorRow,
   type AnchorStore,
 } from "./anchor-store"
@@ -27,10 +28,12 @@ export interface ToolCallInput {
   startAnchor?: unknown
   endAnchor?: unknown
   content?: unknown
+  match?: unknown
   anchor?: unknown
   position?: unknown
   destFile?: unknown
   destAnchor?: unknown
+  pattern?: unknown
 }
 
 export interface ToolCallContext {
@@ -407,6 +410,97 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
   }
 
+  // replace_match (#12): sustitución literal case-sensitive de un Match
+  // servido. Reutiliza tracked/disjoint/commit del Batch como `replace`:
+  // cero o múltiples ocurrencias → E_ANCHOR_MATCH sin escribir (falla
+  // sola, sin abortar el batch).
+  async function replaceMatchExecute(rawInput: unknown, context: ToolCallContext) {
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
+    const { abs, rel } = resolveInProject(projectDir, input?.file)
+    const { match, content } = input ?? {}
+    if (typeof match !== "string" || match.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro match requerido (string no vacío)")
+    }
+    if (typeof content !== "string") {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro content requerido (string)")
+    }
+    const batch = batchFor(context?.sessionID, context?.messageID, rel)
+    assertBatchOpen(batch, rel)
+    const disk = await tracked(batch, rel, () => readDisk(abs, rel))
+    const store = storeFor(context.sessionID)
+    const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk).rows)
+    // Conteo literal case-sensitive sobre lo servido (paso +1: los
+    // solapes también cuentan como ambigüedad).
+    let count = 0
+    let at = disk.indexOf(match)
+    while (at >= 0) {
+      count++
+      at = disk.indexOf(match, at + 1)
+    }
+    if (count !== 1) {
+      throw new AnchorStoreError(
+        "E_ANCHOR_MATCH",
+        count === 0
+          ? `Match no servido en "${rel}": ${JSON.stringify(match.slice(0, 120))} (0 ocurrencias; sin escritura)`
+          : `Match ambiguo en "${rel}": ${JSON.stringify(match.slice(0, 120))} (${count} ocurrencias; sin escritura)`,
+      )
+    }
+    const idx = disk.indexOf(match)
+    const startLine = disk.slice(0, idx).split("\n").length
+    const endLine = disk.slice(0, idx + match.length).split("\n").length
+    const preAnchors = oldRows.slice(startLine - 1, endLine).map((r) => r.anchor)
+    assertDisjoint(batch, rel, preAnchors, `match ${JSON.stringify(match.slice(0, 60))}`)
+    const newContent = disk.slice(0, idx) + content + disk.slice(idx + match.length)
+    if (newContent === disk) {
+      return {
+        content: `H_NOOP: no changes to ${rel} (match already matches).`,
+        metadata: { changed: false, file: rel, startLine, endLine },
+      }
+    }
+    await tracked(batch, rel, async () => {
+      checkNewContent(rel, newContent, cfg.maxFileBytes)
+    })
+    await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
+    const committed = await tracked(batch, rel, () =>
+      // Continuación de batch: un solo undo por mensaje (sombra del primero).
+      Promise.resolve(
+        batch && batch.commits > 0
+          ? store.commit(rel, newContent, { keepShadow: true })
+          : store.commit(rel, newContent),
+      ),
+    )
+    // Rango nuevo = viejo ± delta de líneas: el reintento vía re-lectura
+    // sobre lo creado da E_BATCH_OVERLAP.
+    const newEndLine = endLine + (committed.rows.length - oldRows.length)
+    if (batch) {
+      batch.commits++
+      // Touched = líneas originales + filas nuevas post-commit.
+      for (const a of preAnchors) batch.touched.add(a)
+      for (const r of committed.rows.slice(startLine - 1, newEndLine)) batch.touched.add(r.anchor)
+    }
+    const removed = oldRows.slice(startLine - 1, endLine).map((r) => `- ${formatRow(r, cfg.maxLineChars)}`)
+    const added = committed.rows
+      .slice(startLine - 1, newEndLine)
+      .map((r) => `+ ${formatRow(r, cfg.maxLineChars)}`)
+    const lines = [
+      `replace_match ${rel} lines ${startLine}-${endLine} (match ${JSON.stringify(match.slice(0, 60))}):`,
+      ...removed,
+      ...added,
+      `${committed.rows.length} lines total.`,
+      ...formatWarnings(committed.warnings),
+    ]
+    return {
+      content: lines.join("\n"),
+      metadata: {
+        changed: true,
+        file: rel,
+        startLine,
+        endLine: newEndLine,
+        totalLines: committed.rows.length,
+      },
+    }
+  }
+
   async function insertExecute(rawInput: unknown, context: ToolCallContext) {
     const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
@@ -628,6 +722,48 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
   }
 
+  async function grepExecute(rawInput: unknown, context: ToolCallContext) {
+    // Read-only: peek del served-record + disco, nunca serve/commit.
+    const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
+    const { abs, rel } = resolveInProject(projectDir, input?.file)
+    const pattern = input?.pattern
+    if (typeof pattern !== "string" || pattern.length === 0) {
+      throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro pattern requerido (string no vacío)")
+    }
+    if (isExcluded(rel, cfg.excludes)) {
+      throw new AnchorStoreError("E_PATH_EXCLUDED", `Path excluido: "${rel}"`)
+    }
+    await readDisk(abs, rel)
+    const store = storeFor(context.sessionID)
+    const served = store.peek(rel)
+    if (!served) {
+      return {
+        content: `H_READ_FIRST: "${rel}" no está servido en esta sesión; usa read para servirlo antes de buscar.`,
+        metadata: { served: false, file: rel, pattern },
+      }
+    }
+    // Literal case-sensitive (como replace_match): sin regex.
+    const matches = served.filter((r) => r.content.includes(pattern))
+    // Mismos topes que read: parseOffset/parseLimit/renderPage sobre matches.
+    const startLine = parseOffset(input?.offset, (anchor) => {
+      const idx = matches.findIndex((r) => r.anchor === anchor)
+      if (idx < 0) {
+        throw new AnchorStoreError(
+          "E_INVALID_INPUT",
+          `offset anchor no está entre las coincidencias: "${anchor}"`,
+        )
+      }
+      return idx + 1
+    })
+    const limit = parseLimit(input?.limit, cfg.maxOutputLines)
+    const page = renderPage(matches, startLine, limit, [], cfg)
+    const lines = [`grep "${pattern}" in ${rel}: ${matches.length} match(es).`, page.text]
+    return {
+      content: lines.join("\n"),
+      metadata: { served: true, file: rel, pattern, totalMatches: matches.length, ...page.metadata },
+    }
+  }
+
   const readDef = {
     name: "read",
     description: "Read a file served as anchor│content rows for stable anchor edits (paginated).",
@@ -663,6 +799,25 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     },
     options: { codemode: false },
     execute: replaceExecute,
+  }
+  const replaceMatchDef = {
+    name: "replace_match",
+    description: "Replace a single literal match of served text (verified against served-record).",
+    input: {
+      type: "object",
+      properties: {
+        file: { type: "string" },
+        match: {
+          type: "string",
+          description: "Literal case-sensitive text to replace (exactly one occurrence in served content).",
+        },
+        content: { type: "string", description: "Replacement text." },
+      },
+      required: ["file", "match", "content"],
+      additionalProperties: false,
+    },
+    options: { codemode: false },
+    execute: replaceMatchExecute,
   }
   const insertDef = {
     name: "insert",
@@ -700,6 +855,27 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     options: { codemode: false },
     execute: copyExecute,
   }
+  const grepDef = {
+    name: "anchor_grep",
+    description:
+      "Search served anchors for a literal substring (read-only: never serves or mutates).",
+    input: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "Project-relative file path (must be served)." },
+        pattern: { type: "string", description: "Literal case-sensitive substring to find." },
+        offset: {
+          anyOf: [{ type: "number" }, { type: "string" }],
+          description: "1-based match number or anchor to start from.",
+        },
+        limit: { type: "number", description: `Max rows (default ${cfg.maxOutputLines}).` },
+      },
+      required: ["file", "pattern"],
+      additionalProperties: false,
+    },
+    options: { codemode: false },
+    execute: grepExecute,
+  }
   const undoDef = {
     name: "undo_last_change",
     description: "Restore a file to its pre-edit state (single-level per file, persistent).",
@@ -733,9 +909,11 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       editor.add(readDef)
     }
     if (!editor.get("replace")) editor.add(replaceDef)
+    if (!editor.get("replace_match")) editor.add(replaceMatchDef)
     if (!editor.get("insert")) editor.add(insertDef)
     if (!editor.get("copy")) editor.add(copyDef)
     if (!editor.get("undo_last_change")) editor.add(undoDef)
+    if (!editor.get("anchor_grep")) editor.add(grepDef)
   })
 
   return () => {

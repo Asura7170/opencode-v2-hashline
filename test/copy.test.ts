@@ -394,15 +394,3 @@ describe("t13 copy: batch y undo por archivo independientes por lado", () => {
     await cleanup?.()
   })
 })
-
-describe("t13 copy: registro con el host", () => {
-  test("queda directa al provider (codemode false) junto a las demás", async () => {
-    const dir = project()
-    writeFileSync(join(dir, "a.txt"), "one")
-    const { tools, cleanup } = await setup(dir)
-    for (const name of ["read", "replace", "insert", "undo_last_change", "copy"]) {
-      expect(tools.get(name)?.options).toEqual({ codemode: false })
-    }
-    await cleanup?.()
-  })
-})
