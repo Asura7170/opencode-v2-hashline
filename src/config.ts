@@ -23,7 +23,9 @@ export const DEFAULT_CONFIG: HashlineConfig = {
   maxOutputBytes: 50 * 1024,
   maxLineChars: 2000,
   maxFileBytes: 1_048_576,
-  // shortcut: default sin calibrar contra hardware real; tunable aquí.
+  // Calibrado #16 (bench/bench-4096.ts, i5-12400F/48GB/Win11/bun 1.4.2):
+  // ingest 2.91ms, align 1.79ms, commit 1.54ms a 4096 anchors (peor caso
+  // 13.30ms, sin warnings de cuota); 4096 se queda.
   maxAnchors: 4096,
   excludes: [...DEFAULT_EXCLUDES],
 }
