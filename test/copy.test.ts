@@ -168,6 +168,38 @@ describe("t13 copy a destino servido", () => {
     await cleanup?.()
   })
 
+  test("destino servido en otra sesión → E_ANCHOR_STALE sin auto-servir (US7)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a1\na2")
+    writeFileSync(join(dir, "b.txt"), "b1\nb2")
+    const { tools, cleanup } = await setup(dir)
+    const ctxS1 = callCtx("s1", "m1")
+    const ctxS2 = callCtx("s2", "m1")
+    const src = await anchorsOf(tools, "a.txt", ctxS1)
+    const dstS2 = await anchorsOf(tools, "b.txt", ctxS2)
+    // Anchor real pero de otra sesión: en s1 el destino sigue no servido.
+    await expect(
+      tools
+        .get("copy")
+        .execute(
+          {
+            file: "a.txt",
+            startAnchor: src[0].anchor,
+            destFile: "b.txt",
+            destAnchor: dstS2[0].anchor,
+            position: "after",
+          },
+          ctxS1,
+        ),
+    ).rejects.toThrow(/E_ANCHOR_STALE/)
+    expect(await readFile(join(dir, "b.txt"), "utf-8")).toBe("b1\nb2")
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a1\na2")
+    // Sin efecto lateral: el fallo no sirvió b.txt en s1.
+    const grep = await tools.get("anchor_grep").execute({ file: "b.txt", pattern: "b1" }, ctxS1)
+    expect(grep.metadata.served).toBe(false)
+    await cleanup?.()
+  })
+
   test("no hereda served-record del origen", async () => {
     const dir = project()
     writeFileSync(join(dir, "a.txt"), "a1\na2")
