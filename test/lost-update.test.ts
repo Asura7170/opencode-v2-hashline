@@ -65,6 +65,7 @@ async function setup(projectDir: string) {
     excludes: DEFAULT_CONFIG.excludes,
   })
   let hook: DiskHook = null
+  let restoreHook: DiskHook = null
   const wrapper: AnchorStore = {
     ...real,
     serve(filePath, content) {
@@ -75,6 +76,14 @@ async function setup(projectDir: string) {
       }
       return real.serve(filePath, content)
     },
+    restoreShadow(filePath, diskLines) {
+      if (restoreHook && filePath === restoreHook.file) {
+        const { mutate } = restoreHook
+        restoreHook = null
+        mutate()
+      }
+      return real.restoreShadow(filePath, diskLines)
+    },
   }
   const cleanup = await registerCoreTools(ctx, {
     config: DEFAULT_CONFIG,
@@ -83,11 +92,14 @@ async function setup(projectDir: string) {
   const arm = (file: string, mutate: () => void) => {
     hook = { file, mutate }
   }
+  const armRestore = (file: string, mutate: () => void) => {
+    restoreHook = { file, mutate }
+  }
   const done = async () => {
     await cleanup()
     real.close()
   }
-  return { tools, arm, done }
+  return { tools, arm, armRestore, real, done }
 }
 
 function callCtx(sessionID = "s1", messageID = "m1") {
@@ -222,6 +234,32 @@ describe("lost update: el archivo cambia entre el read y la escritura", () => {
     ).rejects.toThrow(/E_FILE_CHANGED/)
     expect(await readFile(dstAbs, "utf-8")).toBe("b1\nb2")
     expect(await readFile(srcAbs, "utf-8")).toBe("externo\n")
+    await done()
+  })
+
+  test("undo: si la escritura aborta, la sombra vuelve al store y el disco no se pisa", async () => {
+    const dir = project()
+    const abs = join(dir, "a.txt")
+    writeFileSync(abs, "one\ntwo\nthree")
+    const { tools, armRestore, real, done } = await setup(dir)
+    const ctx = callCtx()
+    const rows = await rowsOf(tools, "a.txt", ctx)
+    await tools.get("replace").execute(
+      { file: "a.txt", startAnchor: rows[0].anchor, endAnchor: rows[0].anchor, content: "editado" },
+      ctx,
+    )
+    // El cambio externo ocurre después del read del undo y antes de su escritura.
+    armRestore("a.txt", () => writeFileSync(abs, "externo\n"))
+    await expect(tools.get("undo_last_change").execute({ file: "a.txt" }, ctx)).rejects.toThrow(
+      /E_FILE_CHANGED/,
+    )
+    expect(await readFile(abs, "utf-8")).toBe("externo\n")
+    // Rollback: la sombra consumida por restoreShadow vuelve a estar disponible.
+    expect(real.undoShadow("a.txt")).toEqual(["one", "two", "three"])
+    // Segundo intento: falla por stale (el disco ya no coincide), no por vacío.
+    await expect(tools.get("undo_last_change").execute({ file: "a.txt" }, ctx)).rejects.toThrow(
+      /E_ANCHOR_STALE/,
+    )
     await done()
   })
 })

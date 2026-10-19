@@ -144,8 +144,8 @@ export interface MentionRef {
 }
 
 // shortcut: solo tokens con '.'/'/'/'\' prueban disco; sin él cada palabra costaría un read.
-// La comilla solo abre segmento si empieza token (cur vacío): el apóstrofo de
-// "don't" sigue literal y no traga el resto del mensaje.
+// La comilla solo abre segmento al inicio del token (cur vacío) o justo tras
+// el `@` (@"/ruta con espacios"): el apóstrofo de "don't" sigue literal.
 // `explicit` = el token venía con `@` (tras comillas/corchetes iniciales): su
 // fallo sí se nota; una mención desnuda solo se sirve si el archivo existe.
 export function extractMentionedRefs(text: string): MentionRef[] {
@@ -176,7 +176,7 @@ export function extractMentionedRefs(text: string): MentionRef[] {
       } else {
         cur += c
       }
-    } else if ((c === '"' || c === "'") && cur === "") {
+    } else if ((c === '"' || c === "'") && (cur === "" || cur === "@")) {
       quote = c
     } else if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v") {
       flush()

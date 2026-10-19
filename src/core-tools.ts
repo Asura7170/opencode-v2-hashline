@@ -1015,7 +1015,19 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const store = storeFor(context.sessionID)
     const restored = store.restoreShadow(rel, diskLines)
     const restoredLines = restored.rows.map((r) => r.content)
-    await writeAtomic(abs, serialize(restoredLines, diskMeta), diskRaw, rel)
+    try {
+      await writeAtomic(abs, serialize(restoredLines, diskMeta), diskRaw, rel)
+    } catch (err) {
+      // restoreShadow ya consumió la sombra; si la escritura falla, commit
+      // devuelve el estado pre-undo y la sombra disponible. Archivo borrado
+      // (diskLines null): sin estado en disco que restaurar, solo se relanza.
+      if (diskLines !== null) {
+        try {
+          store.commit(rel, diskLines.join("\n"))
+        } catch {}
+      }
+      throw err
+    }
     // El undo cierra los batches abiertos de este archivo: el próximo edit
     // abre un nivel de undo fresco.
     const sessionID = context?.sessionID

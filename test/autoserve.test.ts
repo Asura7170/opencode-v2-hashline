@@ -68,6 +68,13 @@ describe("extractMentionedRefs", () => {
       { token: "c.md", explicit: false },
     ])
   })
+
+  test('@"ruta con espacios" abre comilla tras la @; el apóstrofo de don\'t no', () => {
+    expect(extractMentionedRefs('@"src/a b.ts"')).toEqual([
+      { token: "src/a b.ts", explicit: true },
+    ])
+    expect(extractMentionedRefs("don't revisa a.txt")).toEqual([{ token: "a.txt", explicit: false }])
+  })
 })
 
 describe("autoServeMentionedPaths", () => {
@@ -125,6 +132,22 @@ describe("autoServeMentionedPaths", () => {
     const proj = withProjectKeys(store, dir)
     const { served, skipped } = await autoServeMentionedPaths(
       'revisa "mi archivo.txt" por favor',
+      dir,
+      proj,
+    )
+    expect(skipped).toEqual([])
+    expect(served.map((s) => s.file)).toEqual(["mi archivo.txt"])
+    expect(proj.peek(join(dir, "mi archivo.txt"))?.map((r) => r.content)).toEqual(["one", "two"])
+    store.close()
+  })
+
+  test('@"path con espacios" (mención explícita) queda servido', async () => {
+    const dir = project()
+    writeFileSync(join(dir, "mi archivo.txt"), "one\ntwo")
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths(
+      'revisa @"mi archivo.txt" por favor',
       dir,
       proj,
     )
