@@ -9,6 +9,7 @@ import { withProjectKeys } from "../src/config"
 import {
   autoServeMentionedPaths,
   extractMentionedPaths,
+  extractMentionedRefs,
   formatAutoReadNote,
 } from "../src/atfile"
 
@@ -57,6 +58,18 @@ describe("extractMentionedPaths", () => {
   })
 })
 
+describe("extractMentionedRefs", () => {
+  test("marca explícito solo el token con @; el dedupe gana explícito", () => {
+    expect(extractMentionedRefs("revisa a.txt y (@a.txt)")).toEqual([
+      { token: "a.txt", explicit: true },
+    ])
+    expect(extractMentionedRefs("`@sub/b.ts` y c.md")).toEqual([
+      { token: "sub/b.ts", explicit: true },
+      { token: "c.md", explicit: false },
+    ])
+  })
+})
+
 describe("autoServeMentionedPaths", () => {
   test("sirve el mencionado con la misma clave relativa de los tools", async () => {
     const dir = project()
@@ -89,13 +102,13 @@ describe("autoServeMentionedPaths", () => {
     const store = memStore()
     const proj = withProjectKeys(store, dir)
     const { served, skipped } = await autoServeMentionedPaths(
-      "mira ok.txt ../fuera.txt missing.txt",
+      "mira ok.txt @../fuera.txt @missing.txt",
       dir,
       proj,
     )
     expect(served.map((s) => s.file)).toEqual(["ok.txt"])
-    // Gate: fuera del proyecto deja nota motivada; lo ilegible (missing.txt,
-    // borrado tras mencionar) también deja skip con nota, sin E_ nuevos.
+    // Gate: fuera del proyecto y lo ilegible notan solo con mención `@`;
+    // sin E_ nuevos.
     expect(skipped.map((s) => s.file)).toEqual(["../fuera.txt", "missing.txt"])
     expect(skipped[0].reason).toMatch(/fuera del proyecto/)
     expect(skipped[1].reason).toMatch(/no se pudo leer/)
@@ -127,13 +140,94 @@ describe("autoServeMentionedPaths", () => {
     writeFileSync(join(dir, "ok.txt"), "a\nb")
     const store = memStore()
     const proj = withProjectKeys(store, dir)
-    const { served, skipped } = await autoServeMentionedPaths("mira ok.txt sub/", dir, proj)
+    const { served, skipped } = await autoServeMentionedPaths("mira ok.txt @sub/", dir, proj)
     expect(served.map((s) => s.file)).toEqual(["ok.txt"])
     expect(skipped.map((s) => s.file)).toEqual(["sub"])
     expect(skipped[0].reason).toMatch(/no se pudo leer/)
     expect(skipped[0].reason).toMatch(/directorio/)
     expect(skipped[0].reason).not.toMatch(/E_[A-Z_]+/)
     expect(proj.peek(join(dir, "sub"))).toBeNull()
+    store.close()
+  })
+})
+
+describe("política de menciones (@ vs desnudas)", () => {
+  test("prosa del reporte no genera candidatos ni nota", async () => {
+    const dir = project()
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths(
+      "analiza prompt/input, ia/agente y toque/edite; usa ^2.0.32",
+      dir,
+      proj,
+    )
+    expect(served).toEqual([])
+    expect(skipped).toEqual([])
+    expect(formatAutoReadNote([], served, skipped)).toBeNull()
+    store.close()
+  })
+
+  test("existente sin @ se sirve; inexistente sin @ calla", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "b.txt"), "one\ntwo")
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths("revisa b.txt y missing.txt", dir, proj)
+    expect(served.map((s) => s.file)).toEqual(["b.txt"])
+    expect(skipped).toEqual([])
+    store.close()
+  })
+
+  test("@missing.txt deja skip motivado", async () => {
+    const dir = project()
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths("revisa @missing.txt", dir, proj)
+    expect(served).toEqual([])
+    expect(skipped.map((s) => s.file)).toEqual(["missing.txt"])
+    expect(skipped[0].reason).toMatch(/no existe o fue borrado/)
+    store.close()
+  })
+
+  test("fuera del proyecto: sin @ calla, con @ nota", async () => {
+    const dir = project()
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const silent = await autoServeMentionedPaths("revisa ../fuera.txt", dir, proj)
+    expect(silent.served).toEqual([])
+    expect(silent.skipped).toEqual([])
+    const noted = await autoServeMentionedPaths("revisa @../fuera.txt", dir, proj)
+    expect(noted.skipped.map((s) => s.file)).toEqual(["../fuera.txt"])
+    expect(noted.skipped[0].reason).toMatch(/fuera del proyecto/)
+    store.close()
+  })
+
+  test("directorio: sin @ calla, con @ deja EISDIR", async () => {
+    const dir = project()
+    mkdirSync(join(dir, "sub"))
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const silent = await autoServeMentionedPaths("revisa sub/", dir, proj)
+    expect(silent.served).toEqual([])
+    expect(silent.skipped).toEqual([])
+    const noted = await autoServeMentionedPaths("revisa @sub/", dir, proj)
+    expect(noted.skipped.map((s) => s.file)).toEqual(["sub"])
+    expect(noted.skipped[0].reason).toMatch(/directorio/)
+    store.close()
+  })
+
+  test(".env nunca se auto-sirve, ni con @, y no deja nota", async () => {
+    const dir = project()
+    writeFileSync(join(dir, ".env"), "TOKEN=1")
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const naked = await autoServeMentionedPaths("revisa .env", dir, proj)
+    expect(naked.served).toEqual([])
+    expect(naked.skipped).toEqual([])
+    const explicit = await autoServeMentionedPaths("revisa @.env", dir, proj)
+    expect(explicit.served).toEqual([])
+    expect(explicit.skipped).toEqual([])
+    expect(proj.peek(join(dir, ".env"))).toBeNull()
     store.close()
   })
 })
@@ -190,7 +284,7 @@ describe("Gate de skips #20", () => {
     writeFileSync(join(dir, "dist", "app.min.js"), "x\ny")
     const store = memStore()
     const proj = withProjectKeys(store, dir)
-    const { served, skipped } = await autoServeMentionedPaths("mira dist/app.min.js", dir, proj)
+    const { served, skipped } = await autoServeMentionedPaths("mira @dist/app.min.js", dir, proj)
     expect(served).toEqual([])
     expect(skipped.map((s) => s.file)).toEqual(["dist/app.min.js"])
     expect(skipped[0].reason).toMatch(/excluido/i)
@@ -203,7 +297,7 @@ describe("Gate de skips #20", () => {
     writeFileSync(join(dir, "big.txt"), "0123456789\n")
     const store = memStore("s1", { maxFileBytes: 8 })
     const proj = withProjectKeys(store, dir)
-    const { served, skipped } = await autoServeMentionedPaths("mira big.txt", dir, proj)
+    const { served, skipped } = await autoServeMentionedPaths("mira @big.txt", dir, proj)
     expect(served).toEqual([])
     expect(skipped.map((s) => s.file)).toEqual(["big.txt"])
     expect(skipped[0].reason).toMatch(/excede/)
@@ -218,7 +312,7 @@ describe("Gate de skips #20", () => {
     const store = memStore("s1", { maxAnchors: 2 })
     const proj = withProjectKeys(store, dir)
     proj.serve(join(dir, "f1.txt"), "a\nb")
-    const { served, skipped } = await autoServeMentionedPaths("mira clash.min.js", dir, proj)
+    const { served, skipped } = await autoServeMentionedPaths("mira @clash.min.js", dir, proj)
     expect(served).toEqual([])
     expect(skipped.map((s) => s.file)).toEqual(["clash.min.js"])
     expect(skipped[0].reason).toMatch(/excluido/i)
@@ -235,7 +329,7 @@ describe("Gate de skips #20", () => {
     const store = memStore("s1", { maxAnchors: 2, maxFileBytes: 8 })
     const proj = withProjectKeys(store, dir)
     proj.serve(join(dir, "f1.txt"), "a\nb")
-    const { served, skipped } = await autoServeMentionedPaths("mira gordo.txt", dir, proj)
+    const { served, skipped } = await autoServeMentionedPaths("mira @gordo.txt", dir, proj)
     expect(served).toEqual([])
     expect(skipped.map((s) => s.file)).toEqual(["gordo.txt"])
     expect(skipped[0].reason).toMatch(/excede/)
@@ -250,7 +344,7 @@ describe("Gate de skips #20", () => {
     writeFileSync(join(dir, "big.txt"), "0123456789\n")
     const store = memStore("s1", { maxFileBytes: 8 })
     const proj = withProjectKeys(store, dir)
-    const { skipped } = await autoServeMentionedPaths("mira ../fuera.txt big.txt", dir, proj)
+    const { skipped } = await autoServeMentionedPaths("mira @../fuera.txt @big.txt", dir, proj)
     expect(skipped).toHaveLength(2)
     for (const s of skipped) expect(s.reason).not.toMatch(/E_[A-Z_]+/)
     store.close()
@@ -279,5 +373,17 @@ describe("formatAutoReadNote", () => {
     expect(note).toMatch(/H_AUTO_READ/)
     expect(note).toContain("x.txt")
     expect(note).toContain("Cuota")
+  })
+
+  test("tope de 200 filas inlineadas con aviso de truncado", () => {
+    const rows = Array.from({ length: 250 }, (_, i) => ({
+      anchor: "abcd",
+      line: i + 1,
+      content: `l${i}`,
+    }))
+    const note = formatAutoReadNote([], [{ file: "big.txt", lines: 250, rows }]) ?? ""
+    const shown = note.split("\n").filter((l) => /^[a-z]{4}│/.test(l)).length
+    expect(shown).toBe(200)
+    expect(note).toContain("… (+50 line(s) not shown)")
   })
 })
