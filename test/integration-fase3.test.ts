@@ -76,7 +76,7 @@ async function promptOf(
 }
 
 describe("t22 flujo combinado fase 3", () => {
-  test("referencia → auto-serve → edit → skip ajeno → undo", async () => {
+  test("referencia → auto-serve (re-serve cross-sesión incluido) → edit → undo", async () => {
     const dir = project()
     writeFileSync(join(dir, "a.txt"), "a1\na2")
     writeFileSync(join(dir, "b.txt"), "b1")
@@ -84,10 +84,11 @@ describe("t22 flujo combinado fase 3", () => {
     const { ctx, tools, hooks } = makeCtx(dir)
     const cleanup = (await plugin.setup(ctx)) as () => Promise<void>
 
-    // c.txt con dueño ajeno: servido en s9 con anchor real.
+    // c.txt ya servido por otra sesión (sidecars por sesión, montaje real).
     await tools.get("read")!.execute({ file: "c.txt" }, callCtx("s9", "m1"))
 
-    // s1 referencia a.txt (adjunto), b.txt y c.txt (mencionados).
+    // s1 referencia a.txt (adjunto), b.txt y c.txt (mencionados): re-servir
+    // lo servido por otra sesión es válido (cada sesión lleva su sidecar).
     const prompt = await promptOf(hooks, "s1", {
       text: "toca b.txt y revisa c.txt",
       files: [{ uri: join(dir, "a.txt") }],
@@ -95,7 +96,7 @@ describe("t22 flujo combinado fase 3", () => {
     expect(prompt.text).toMatch(/H_AUTO_READ/)
     expect(prompt.text).toContain("a.txt")
     expect(prompt.text).toContain("b.txt")
-    // c.txt ajeno: skip motivado, sin robo.
+    // c.txt re-servido: aparece servido en la nota, sin skip.
     expect(prompt.text).toContain("c.txt")
 
     // Edit sobre auto-servido sin `read` previo (anchor del temp swappeado).

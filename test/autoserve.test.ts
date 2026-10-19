@@ -139,29 +139,28 @@ describe("autoServeMentionedPaths", () => {
 })
 
 describe("Gate de skips #20", () => {
-  test("dueño de otra sesión → skip con nota, sin robar ownership", async () => {
+  test("re-servir lo servido por otra sesión es válido (sidecars por sesión)", async () => {
     const dir = project()
     writeFileSync(join(dir, "ajeno.txt"), "a1\na2")
-    const db = sharedDb("ajeno")
-    const otra = createAnchorStore({ sessionId: "s-otra", storePath: db })
+    // Geometría real: cada sesión abre su PROPIO sidecar (nada compartido).
+    const dbOtra = sharedDb("ajeno-otra")
+    const otra = createAnchorStore({ sessionId: "s-otra", storePath: dbOtra })
     // Anchor REAL servido en sesión ajena (nunca inventado: "zzzz" daría
     // verde aunque la impl ensanchara served-record como efecto lateral).
     const foreignAnchor = otra.serve("ajeno.txt", "a1\na2").rows[0].anchor
     otra.close()
-    const store = createAnchorStore({ sessionId: "s-mia", storePath: db })
+
+    const store = createAnchorStore({ sessionId: "s-mia", storePath: sharedDb("ajeno-mia") })
     const proj = withProjectKeys(store, dir)
     const { served, skipped } = await autoServeMentionedPaths("revisa ajeno.txt", dir, proj)
-    expect(served).toEqual([])
-    expect(skipped.map((s) => s.file)).toEqual(["ajeno.txt"])
-    expect(skipped[0].reason).toMatch(/otra sesi/)
-    // Sin robar ni servir: el anchor ajeno sigue stale aquí, sin served-record.
+    expect(served.map((s) => s.file)).toEqual(["ajeno.txt"])
+    expect(skipped).toEqual([])
+    // Sin herencia: el anchor ajeno sigue stale aquí; la sesión ajena queda intacta.
     expect(() => store.resolve("ajeno.txt", foreignAnchor)).toThrow(/E_ANCHOR_STALE/)
-    expect(proj.peek(join(dir, "ajeno.txt"))).toBeNull()
-    store.close()
-    // La otra sesión conserva ownership y sombras intactos.
-    const vuelta = createAnchorStore({ sessionId: "s-otra", storePath: db })
+    const vuelta = createAnchorStore({ sessionId: "s-otra", storePath: dbOtra })
     expect(vuelta.resolve("ajeno.txt", foreignAnchor)).toEqual({ line: 1, content: "a1" })
     vuelta.close()
+    store.close()
   })
 
   test("cuota llena → skip con nota, sin reclamar LRU", async () => {
@@ -212,51 +211,38 @@ describe("Gate de skips #20", () => {
     store.close()
   })
 
-  test("excluido y ajeno → motivo excluido (orden del Gate)", async () => {
+  test("excluido y cuota llena → motivo excluido (orden del Gate)", async () => {
     const dir = project()
     writeFileSync(join(dir, "clash.min.js"), "x\ny")
-    const db = sharedDb("excl-ajeno")
-    // Clave relativa real servida en sesión ajena con excludes vacíos (con los
-    // defaults no podría servirse: el anchor inventado queda prohibido).
-    const otra = createAnchorStore({ sessionId: "s-otra", storePath: db, excludes: [] })
-    const foreignAnchor = otra.serve("clash.min.js", "x\ny").rows[0].anchor
-    otra.close()
-    const store = createAnchorStore({ sessionId: "s-mia", storePath: db })
+    writeFileSync(join(dir, "f1.txt"), "a\nb")
+    const store = memStore("s1", { maxAnchors: 2 })
     const proj = withProjectKeys(store, dir)
+    proj.serve(join(dir, "f1.txt"), "a\nb")
     const { served, skipped } = await autoServeMentionedPaths("mira clash.min.js", dir, proj)
     expect(served).toEqual([])
     expect(skipped.map((s) => s.file)).toEqual(["clash.min.js"])
     expect(skipped[0].reason).toMatch(/excluido/i)
-    expect(skipped[0].reason).not.toMatch(/otra sesi/)
+    expect(skipped[0].reason).not.toMatch(/cuota/i)
     expect(skipped[0].reason).not.toMatch(/E_[A-Z_]+/)
     expect(proj.peek(join(dir, "clash.min.js"))).toBeNull()
     store.close()
-    // La otra sesión conserva ownership intacto.
-    const vuelta = createAnchorStore({ sessionId: "s-otra", storePath: db, excludes: [] })
-    expect(vuelta.resolve("clash.min.js", foreignAnchor)).toEqual({ line: 1, content: "x" })
-    vuelta.close()
   })
 
-  test("oversize y ajeno → motivo oversize (orden del Gate)", async () => {
+  test("oversize y cuota llena → motivo oversize (orden del Gate)", async () => {
     const dir = project()
     writeFileSync(join(dir, "gordo.txt"), "0123456789\n")
-    const db = sharedDb("gordo-ajeno")
-    const otra = createAnchorStore({ sessionId: "s-otra", storePath: db })
-    const foreignAnchor = otra.serve("gordo.txt", "0123456789\n").rows[0].anchor
-    otra.close()
-    const store = createAnchorStore({ sessionId: "s-mia", storePath: db, maxFileBytes: 8 })
+    writeFileSync(join(dir, "f1.txt"), "a\nb")
+    const store = memStore("s1", { maxAnchors: 2, maxFileBytes: 8 })
     const proj = withProjectKeys(store, dir)
+    proj.serve(join(dir, "f1.txt"), "a\nb")
     const { served, skipped } = await autoServeMentionedPaths("mira gordo.txt", dir, proj)
     expect(served).toEqual([])
     expect(skipped.map((s) => s.file)).toEqual(["gordo.txt"])
     expect(skipped[0].reason).toMatch(/excede/)
-    expect(skipped[0].reason).not.toMatch(/otra sesi/)
+    expect(skipped[0].reason).not.toMatch(/cuota/i)
     expect(skipped[0].reason).not.toMatch(/E_[A-Z_]+/)
     expect(proj.peek(join(dir, "gordo.txt"))).toBeNull()
     store.close()
-    const vuelta = createAnchorStore({ sessionId: "s-otra", storePath: db })
-    expect(vuelta.resolve("gordo.txt", foreignAnchor)).toEqual({ line: 1, content: "0123456789" })
-    vuelta.close()
   })
 
   test("ningún skip abre served-record: cero E_ nuevos en los motivos", async () => {
@@ -288,10 +274,10 @@ describe("formatAutoReadNote", () => {
     const note = formatAutoReadNote(
       [],
       [],
-      [{ file: "x.txt", reason: "dueño de otra sesión (no se roba ownership)" }],
+      [{ file: "x.txt", reason: "sin Cuota libre bajo maxAnchors 4096" }],
     )
     expect(note).toMatch(/H_AUTO_READ/)
     expect(note).toContain("x.txt")
-    expect(note).toContain("dueño de otra sesión")
+    expect(note).toContain("Cuota")
   })
 })

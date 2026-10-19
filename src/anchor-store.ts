@@ -79,8 +79,6 @@ export interface AnchorStore {
   peek(filePath: string): AnchorRow[] | null
   /** Guardas puras (excluido/oversize/binario) sin mutar served-record. */
   checkServable(filePath: string, content: string): void
-  /** Dueño del served-record, o null si jamás servido. Lectura sin efectos. */
-  ownerOf(filePath: string): string | null
   /** Uso de Cuota: anchors vivos y tope. Lectura sin efectos. */
   usage(): { used: number; max: number }
   undoShadow(filePath: string): string[] | null
@@ -406,9 +404,6 @@ export function createAnchorStore(opts: AnchorStoreOptions): AnchorStore {
     },
     checkServable(filePath: string, content: string): void {
       checkGuards(filePath, content)
-    },
-    ownerOf(filePath: string): string | null {
-      return files.get(filePath)?.owner ?? null
     },
     usage(): { used: number; max: number } {
       return { used: totalAnchors, max: maxAnchors }
