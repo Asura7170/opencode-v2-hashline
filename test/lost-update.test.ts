@@ -206,6 +206,43 @@ describe("lost update: el archivo cambia entre el read y la escritura", () => {
     await done()
   })
 
+  test("move: si el vaciado del origen falla, el edit del destino conserva la sombra del move", async () => {
+    const dir = project()
+    const srcAbs = join(dir, "a.txt")
+    const dstAbs = join(dir, "b.txt")
+    writeFileSync(srcAbs, "a1\na2")
+    writeFileSync(dstAbs, "b1\nb2")
+    const { tools, arm, done } = await setup(dir)
+    const ctx = callCtx()
+    const src = await rowsOf(tools, "a.txt", ctx)
+    const dst = await rowsOf(tools, "b.txt", ctx)
+    // El origen cambia durante el serve del destino: el destino commitea y el
+    // vaciado del origen falla después con E_FILE_CHANGED.
+    arm("b.txt", () => writeFileSync(srcAbs, "externo\n"))
+    await expect(
+      tools.get("move").execute(
+        {
+          file: "a.txt",
+          startAnchor: src[0].anchor,
+          endAnchor: src[1].anchor,
+          destFile: "b.txt",
+          destAnchor: dst[0].anchor,
+          position: "after",
+        },
+        ctx,
+      ),
+    ).rejects.toThrow(/E_FILE_CHANGED/)
+    // Mismo mensaje: editar el destino (fila b2 intacta) y deshacer debe volver
+    // al estado PRE-move; sin el marcado temprano se perdería esa sombra.
+    const moved = await rowsOf(tools, "b.txt", ctx)
+    await tools
+      .get("replace")
+      .execute({ file: "b.txt", startAnchor: moved[3].anchor, content: "B2" }, ctx)
+    await tools.get("undo_last_change").execute({ file: "b.txt" }, ctx)
+    expect(await readFile(dstAbs, "utf-8")).toBe("b1\nb2")
+    await done()
+  })
+
   test("move: pre-check del origen aborta antes de tocar el destino", async () => {
     const dir = project()
     const srcAbs = join(dir, "a.txt")

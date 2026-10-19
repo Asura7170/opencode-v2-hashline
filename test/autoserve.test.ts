@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs"
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -12,6 +12,20 @@ import {
   extractMentionedRefs,
   formatAutoReadNote,
 } from "../src/atfile"
+
+// Windows sin developer mode: symlinkSync da EPERM/EACCES → se salta el caso.
+function symlinksSupported(): boolean {
+  const dir = mkdtempSync(join(tmpdir(), "t19-link-probe-"))
+  try {
+    writeFileSync(join(dir, "target"), "x")
+    symlinkSync(join(dir, "target"), join(dir, "link"))
+    return true
+  } catch {
+    return false
+  }
+}
+
+const SYMLINKS = symlinksSupported()
 
 function project(): string {
   return mkdtempSync(join(tmpdir(), "t19-unit-"))
@@ -271,6 +285,36 @@ describe("política de menciones (@ vs desnudas)", () => {
     expect(explicit.served).toEqual([])
     expect(explicit.skipped).toEqual([])
     expect(proj.peek(join(dir, ".env"))).toBeNull()
+    store.close()
+  })
+
+  test(".ENV y .PEM se reconocen por case-fold y no dejan nota", async () => {
+    const dir = project()
+    writeFileSync(join(dir, ".ENV"), "TOKEN=1")
+    writeFileSync(join(dir, "Secret.PEM"), "KEY")
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const naked = await autoServeMentionedPaths("revisa .ENV y Secret.PEM", dir, proj)
+    expect(naked.served).toEqual([])
+    expect(naked.skipped).toEqual([])
+    const explicit = await autoServeMentionedPaths("revisa @.ENV y @Secret.PEM", dir, proj)
+    expect(explicit.served).toEqual([])
+    expect(explicit.skipped).toEqual([])
+    expect(proj.peek(join(dir, ".ENV"))).toBeNull()
+    expect(proj.peek(join(dir, "Secret.PEM"))).toBeNull()
+    store.close()
+  })
+
+  test.skipIf(!SYMLINKS)("symlink .env → env.txt no se sirve (secreto por el token)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "env.txt"), "TOKEN=1")
+    symlinkSync(join(dir, "env.txt"), join(dir, ".env"))
+    const store = memStore()
+    const proj = withProjectKeys(store, dir)
+    const { served, skipped } = await autoServeMentionedPaths("revisa @.env", dir, proj)
+    expect(served).toEqual([])
+    expect(skipped).toEqual([])
+    expect(proj.peek(join(dir, "env.txt"))).toBeNull()
     store.close()
   })
 })

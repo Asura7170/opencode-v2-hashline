@@ -99,15 +99,15 @@ async function assertUnchanged(
 // Escritura atómica: temporal en el mismo directorio + rename (mismo filesystem).
 // Symlink: escribe el target real (rename reemplazaría el enlace). Modo: el
 // inodo nuevo hereda el del destino para no perderlo (p.ej. 0o755).
-// La comprobación anti lost-update va ANTES de crear el temporal; sin
-// expectedRaw no hay chequeo (undo que recrea un archivo borrado pasa undefined).
+// La comprobación anti lost-update corre justo antes del rename; el temporal
+// ya escrito se borra si falla. Sin expectedRaw no hay chequeo (undo que
+// recrea un archivo borrado pasa undefined).
 async function writeAtomic(
   abs: string,
   content: string,
   expectedRaw: string | undefined,
   rel: string,
 ): Promise<void> {
-  await assertUnchanged(abs, expectedRaw, rel)
   let target = abs
   try {
     if ((await lstat(abs)).isSymbolicLink()) target = realpathSync(abs)
@@ -122,6 +122,8 @@ async function writeAtomic(
     } catch (err) {
       if (errorCode(err) !== "ENOENT") throw err
     }
+    // shortcut: la ventana check→rename no es cero sin CAS/lock.
+    await assertUnchanged(abs, expectedRaw, rel)
     await rename(tmp, target)
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => {})
@@ -714,8 +716,8 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
 
   // Camino de commit a destino compartido por copy (#13) y move (#15):
   // serve + resolve del punto, foto, cómputo, pre-escritura, write y commit.
-  // Sin marcado de batch: cada llamador marca al final (move vacía el
-  // origen entre el commit y el marcado sin auto-solaparse).
+  // Sin marcado de batch: cada llamador marca su nivel de undo tras el
+  // commit (move lo hace antes de vaciar el origen, para no perderlo si falla).
   async function commitDestCopy(
     store: AnchorStore,
     batchDst: BatchState | null,
@@ -945,6 +947,14 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await assertUnchanged(srcAbs, srcDisk.raw, srcRel)
     const dest = await commitDestCopy(store, batchDst, dstAbs, dstRel, destAnchor, position, srcLines)
     const { committed, dstResolved, idx } = dest
+    // Nivel de undo del destino antes de vaciar el origen: si el vaciado
+    // falla, el siguiente edit del destino sigue conservando la sombra.
+    if (batchDst) {
+      batchDst.commits++
+      batchDst.touched.add(destAnchor)
+      for (const r of committed.rows.slice(idx, idx + srcLines.length))
+        batchDst.touched.add(r.anchor)
+    }
     // Vaciado del origen ANTES del marcado de preAnchors (aviso #13): toca el
     // mismo rango a propósito y bypassea disjoint (ya verificado arriba).
     // Subconjunto del contenido: sin checkNewContent (solo encoge).
@@ -961,12 +971,6 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
           : store.commit(srcRel, emptied),
       ),
     )
-    if (batchDst) {
-      batchDst.commits++
-      batchDst.touched.add(destAnchor)
-      for (const r of committed.rows.slice(idx, idx + srcLines.length))
-        batchDst.touched.add(r.anchor)
-    }
     if (batchSrc) {
       batchSrc.commits++
       for (const a of preAnchors) batchSrc.touched.add(a)

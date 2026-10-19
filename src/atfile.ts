@@ -194,9 +194,9 @@ export function extractMentionedPaths(text: string): string[] {
 }
 
 // Secretos que el AUTO-READ no sirve ni anota, aunque la mención sea `@`.
-function isSensitiveAutoRead(rel: string): boolean {
-  const name = basename(rel)
-  return name === ".env" || name.startsWith(".env.") || name.endsWith(".pem") || name.endsWith(".key")
+function isSensitiveName(name: string): boolean {
+  const lower = name.toLowerCase()
+  return lower === ".env" || lower.startsWith(".env.") || lower.endsWith(".pem") || lower.endsWith(".key")
 }
 
 // Ilegible en disco (borrado, permiso, directorio): solo la mención explícita
@@ -250,7 +250,8 @@ export async function autoServeMentionedPaths(
       continue
     }
     // Secretos: nunca viajan por AUTO-READ, ni con `@` (silencio, sin nota).
-    if (isSensitiveAutoRead(rel)) continue
+    // El token cubre symlinks cuyo rel ya es el target; el case-fold, .ENV/.PEM.
+    if (isSensitiveName(basename(rel)) || isSensitiveName(basename(tok))) continue
     if (already?.has(rel)) continue
     // Excluido antes de disco: con contenido vacío solo pican
     // excluido/extensión, sin mutar served-record.
