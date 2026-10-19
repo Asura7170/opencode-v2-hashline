@@ -192,7 +192,6 @@ export function withProjectKeys(store: AnchorStore, projectDir: string): AnchorS
     peek: (filePath) => store.peek(keyForFile(projectDir, filePath)),
     checkServable: (filePath, content) =>
       store.checkServable(keyForFile(projectDir, filePath), content),
-    ownerOf: (filePath) => store.ownerOf(keyForFile(projectDir, filePath)),
     usage: () => store.usage(),
     undoShadow: (filePath) => store.undoShadow(keyForFile(projectDir, filePath)),
     restoreShadow: (filePath, diskLines) =>

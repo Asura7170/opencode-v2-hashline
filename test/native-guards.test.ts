@@ -111,7 +111,7 @@ describe("echo-refusal en write nativo", () => {
   test("anchors servidos a write → error estructurado E_ANCHOR_ECHO", async () => {
     const { ctx, toolHooks } = stubHost()
     await plugin.setup(ctx)
-    const input = { file: "a.txt", content: "aaaa│one\ntwo" }
+    const input = { file: "a.txt", content: "foo\nwxyz│bar" }
     try {
       await toolHooks.get("execute.before")!(beforeInput("write", input))
       expect.unreachable()
@@ -119,6 +119,9 @@ describe("echo-refusal en write nativo", () => {
       expect(String(err)).toMatch(/\[E_ANCHOR_ECHO\]/)
       expect(err.code).toBe("E_ANCHOR_ECHO")
       expect(String(err)).toMatch(/replace|insert/)
+      // El mensaje cita el prefijo REAL recibido, no un placeholder fijo.
+      expect(String(err)).toMatch(/wxyz│/)
+      expect(String(err)).not.toMatch(/aaaa│/)
     }
   })
 

@@ -189,11 +189,11 @@ function unreadableReason(code: string | undefined): string {
 
 // Auto-read del #19: sirve lo mencionado con la misma clave relativa que
 // los tools, para que aguas abajo sea indistinguible de un `read` manual.
-// Gate en orden del spec (ADR-0001): dentro del proyecto → excluido (antes de
-// disco y ownership) → servible (ilegible con nota, US7) → oversize/binario →
-// peek-first ante dueño ajeno (skip con nota, sin robar ni servir) → Cuota con
-// holgura (skip con nota, sin reclamar LRU) → tope 10. Todo skip es lectura
-// sin efectos: ningún skip abre served-record. Tope 10 del #21.
+// Gate en orden (ADR-0001): dentro del proyecto → excluido (antes de disco)
+// → servible (ilegible con nota, US7) → oversize/binario → Cuota con holgura
+// (skip con nota, sin reclamar LRU) → tope 10. Los sidecars son por sesión:
+// re-servir lo servido por otra sesión es válido (nada compartido que robar).
+// Todo skip es lectura sin efectos: ningún skip abre served-record. Tope del #21.
 export async function autoServeMentionedPaths(
   text: string,
   projectDir: string,
@@ -221,7 +221,7 @@ export async function autoServeMentionedPaths(
       continue
     }
     if (already?.has(rel)) continue
-    // Excluido antes de disco y de ownership: con contenido vacío solo pican
+    // Excluido antes de disco: con contenido vacío solo pican
     // excluido/extensión, sin mutar served-record.
     try {
       store.checkServable(abs, "")
@@ -238,23 +238,13 @@ export async function autoServeMentionedPaths(
       skipped.push({ file: rel, reason: unreadableReason(errorCode(err)) })
       continue
     }
-    // Oversize/binario antes de ownership y Cuota.
+    // Oversize/binario antes de Cuota.
     try {
       store.checkServable(abs, content)
     } catch (err) {
       const reason = gateNote(err)
       if (reason === null) throw err
       skipped.push({ file: rel, reason })
-      continue
-    }
-    // Peek-first (CODING_STANDARDS.md): lo ajeno se salta antes de servir,
-    // que transferiría ownership y perdería sombras ajenas.
-    const owner = store.ownerOf(abs)
-    if (owner !== null && owner !== store.sessionId) {
-      skipped.push({
-        file: rel,
-        reason: "dueño de otra sesión (no se roba ownership ni se tocan sombras ajenas)",
-      })
       continue
     }
     // Cuota con holgura: solo sirve si cabe, nunca reclama LRU. Re-servir lo

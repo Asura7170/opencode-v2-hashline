@@ -155,6 +155,18 @@ function countEchoesInInput(input: unknown): number {
   return n
 }
 
+// Primer prefijo echo REAL del input, para el mensaje de refusal (G real del IDE).
+function firstEchoSample(input: unknown): string | null {
+  let sample: string | null = null
+  eachString(input, (v) => {
+    if (sample === null && typeof v === "string") {
+      const m = echoRe("m").exec(v)
+      if (m) sample = m[0]
+    }
+  })
+  return sample
+}
+
 export async function registerNativeGuards(ctx: GuardHost): Promise<() => void> {
   const disposers: { dispose: () => Promise<void> }[] = []
   // id de call → ecos limpiados en before, para avisar en after.
@@ -171,9 +183,10 @@ export async function registerNativeGuards(ctx: GuardHost): Promise<() => void> 
           hasEchoesInInput(ev?.input)
         ) {
           const n = countEchoesInInput(ev.input)
+          const sample = firstEchoSample(ev.input)
           throw new AnchorStoreError(
             "E_ANCHOR_ECHO",
-            `Native write recibió ${n} línea(s) con prefijos anchor ("aaaa│…"); ` +
+            `Native write recibió ${n} línea(s) con prefijos anchor (p.ej. ${JSON.stringify(sample ?? "…")}); ` +
               `rechazado para no corromper el archivo. Usa replace/insert con anchors pelados, o quita los prefijos.`,
           )
         }

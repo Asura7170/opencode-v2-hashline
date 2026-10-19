@@ -49,7 +49,7 @@ Búsqueda que solo devuelve anchors ya servidos, sin servir nada nuevo.
 _Avoid_: grep de texto, búsqueda global
 
 **Auto-read**:
-Servido automático de archivos referenciados en el mensaje, sin robar ownership ni reclamar cuota.
+Servido automático de archivos referenciados en el mensaje; con sidecar por sesión, re-servir lo de otra sesión es válido y solo frena la Cuota sin reclamar.
 _Avoid_: rastreo, precarga
 
 **Gate**:
