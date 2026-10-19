@@ -49,11 +49,11 @@ Búsqueda que solo devuelve anchors ya servidos, sin servir nada nuevo.
 _Avoid_: grep de texto, búsqueda global
 
 **Auto-read**:
-Servido automático de archivos referenciados en el mensaje; con sidecar por sesión, re-servir lo de otra sesión es válido y solo frena la Cuota sin reclamar.
+Servido automático de archivos referenciados en el mensaje; una mención sin `@` solo se sirve si el archivo existe (sus fallos callan), `@ruta` conserva la nota motivada, y `.env`/claves nunca se auto-sirven. Con sidecar por sesión, re-servir lo de otra sesión es válido y solo frena la Cuota sin reclamar.
 _Avoid_: rastreo, precarga
 
 **Gate**:
-Criterio que deja pasar o frena un auto-servido, siempre con nota motivada.
+Criterio que deja pasar o frena un auto-servido; la nota se emite para menciones `@`, Cuota y tope.
 _Avoid_: permiso, filtro
 
 **Cuota**:

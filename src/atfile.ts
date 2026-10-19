@@ -120,7 +120,7 @@ export interface AutoServeServed {
   rows: AnchorRow[]
 }
 
-// Esqueleto del Gate (#20): cada skip con su motivo, sin E_ nuevos.
+// Esqueleto del Gate (#20): skip de mención explícita, Cuota o tope, sin E_ nuevos.
 // En el camino feliz del #19 siempre viaja vacío.
 export interface AutoServeSkip {
   file: string
@@ -138,17 +138,27 @@ export interface AutoServeSummary {
 // intentos: un skip del Gate no consume cupo.
 const MAX_AUTO_READ_PER_MESSAGE = 10
 
+export interface MentionRef {
+  token: string
+  explicit: boolean
+}
+
 // shortcut: solo tokens con '.'/'/'/'\' prueban disco; sin él cada palabra costaría un read.
-// La comilla solo abre segmento si empieza token (cur vacío): el apóstrofo de
-// "don't" sigue literal y no traga el resto del mensaje.
-export function extractMentionedPaths(text: string): string[] {
-  const seen = new Set<string>()
+// La comilla solo abre segmento al inicio del token (cur vacío) o justo tras
+// el `@` (@"/ruta con espacios"): el apóstrofo de "don't" sigue literal.
+// `explicit` = el token venía con `@` (tras comillas/corchetes iniciales): su
+// fallo sí se nota; una mención desnuda solo se sirve si el archivo existe.
+export function extractMentionedRefs(text: string): MentionRef[] {
+  const refs = new Map<string, MentionRef>()
   const push = (raw: string): void => {
+    const explicit = raw.replace(/^[<('"[`]+/, "").startsWith("@")
     const tok = raw.replace(/^[@<('"[`]+/, "").replace(/[.,;:!?)"'`\]>]+$/, "")
     if (tok.length === 0 || tok.length > 256) return
     if (!tok.includes("/") && !tok.includes(".") && !tok.includes("\\")) return
     if (tok.includes("://")) return
-    if (!seen.has(tok)) seen.add(tok)
+    const prev = refs.get(tok)
+    if (prev === undefined) refs.set(tok, { token: tok, explicit })
+    else if (explicit) prev.explicit = true
   }
   let cur = ""
   let quote: string | null = null
@@ -166,7 +176,7 @@ export function extractMentionedPaths(text: string): string[] {
       } else {
         cur += c
       }
-    } else if ((c === '"' || c === "'") && cur === "") {
+    } else if ((c === '"' || c === "'") && (cur === "" || cur === "@")) {
       quote = c
     } else if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v") {
       flush()
@@ -175,11 +185,22 @@ export function extractMentionedPaths(text: string): string[] {
     }
   }
   flush()
-  return [...seen]
+  return [...refs.values()]
 }
 
-// Ilegible en disco (borrado, permiso, directorio): skip con nota motivada,
-// sin E_ nuevos (US7). errorCode trae el código del SO (ENOENT, EACCES…).
+// Compatibilidad de API/tests: los tokens en orden, sin la marca de mención.
+export function extractMentionedPaths(text: string): string[] {
+  return extractMentionedRefs(text).map((r) => r.token)
+}
+
+// Secretos que el AUTO-READ no sirve ni anota, aunque la mención sea `@`.
+function isSensitiveName(name: string): boolean {
+  const lower = name.toLowerCase()
+  return lower === ".env" || lower.startsWith(".env.") || lower.endsWith(".pem") || lower.endsWith(".key")
+}
+
+// Ilegible en disco (borrado, permiso, directorio): solo la mención explícita
+// lo nota, sin E_ nuevos (US7). errorCode trae el código del SO (ENOENT, EACCES…).
 function unreadableReason(code: string | undefined): string {
   if (code === "ENOENT") return "no se pudo leer (no existe o fue borrado)"
   if (code === "EACCES" || code === "EPERM") return "no se pudo leer (sin permiso de lectura)"
@@ -190,9 +211,11 @@ function unreadableReason(code: string | undefined): string {
 // Auto-read del #19: sirve lo mencionado con la misma clave relativa que
 // los tools, para que aguas abajo sea indistinguible de un `read` manual.
 // Gate en orden (ADR-0001): dentro del proyecto → excluido (antes de disco)
-// → servible (ilegible con nota, US7) → oversize/binario → Cuota con holgura
-// (skip con nota, sin reclamar LRU) → tope 10. Los sidecars son por sesión:
-// re-servir lo servido por otra sesión es válido (nada compartido que robar).
+// → servible (ilegible, US7) → oversize/binario → Cuota con holgura → tope 10.
+// Una mención desnuda (sin `@`) solo se sirve si existe y es servible: sus
+// fallos callan; la `@ruta` sí deja nota motivada. Cuota y tope 10 notan
+// siempre (son archivos reales que no se sirvieron). Los sidecars son por
+// sesión: re-servir lo servido por otra sesión es válido (nada compartido).
 // Todo skip es lectura sin efectos: ningún skip abre served-record. Tope del #21.
 export async function autoServeMentionedPaths(
   text: string,
@@ -205,21 +228,30 @@ export async function autoServeMentionedPaths(
   const seen = new Set<string>()
   // Los adjuntos ya servidos en este mensaje consumen cupo del tope.
   const servedBudget = (): number => (already?.size ?? 0) + served.length
-  // Rechazo de guarda como nota motivada, sin código E_ (US7/US10).
+  // Rechazo de guarda: solo la mención explícita lo nota (sin código E_).
   const gateNote = (err: unknown): string | null =>
     err instanceof AnchorStoreError ? err.message.replace(/^\[[^\]]+\] /, "") : null
-  for (const tok of extractMentionedPaths(text)) {
+  for (const ref of extractMentionedRefs(text)) {
+    const tok = ref.token
     const abs = resolve(projectDir, tok)
-    if (seen.has(abs)) continue
-    seen.add(abs)
     const rel = relativeKeyFor(projectDir, abs)
+    // Dedupe por clave de proyecto: en Windows dos menciones del mismo archivo
+    // con distinto case comparten rel; fuera del proyecto la clave sigue siendo abs.
+    const seenKey = rel ?? abs
+    if (seen.has(seenKey)) continue
+    seen.add(seenKey)
     if (rel === null) {
-      skipped.push({
-        file: tok,
-        reason: "fuera del proyecto (el Gate no abre lo que read rechaza)",
-      })
+      if (ref.explicit) {
+        skipped.push({
+          file: tok,
+          reason: "fuera del proyecto (el Gate no abre lo que read rechaza)",
+        })
+      }
       continue
     }
+    // Secretos: nunca viajan por AUTO-READ, ni con `@` (silencio, sin nota).
+    // El token cubre symlinks cuyo rel ya es el target; el case-fold, .ENV/.PEM.
+    if (isSensitiveName(basename(rel)) || isSensitiveName(basename(tok))) continue
     if (already?.has(rel)) continue
     // Excluido antes de disco: con contenido vacío solo pican
     // excluido/extensión, sin mutar served-record.
@@ -228,14 +260,14 @@ export async function autoServeMentionedPaths(
     } catch (err) {
       const reason = gateNote(err)
       if (reason === null) throw err
-      skipped.push({ file: rel, reason })
+      if (ref.explicit) skipped.push({ file: rel, reason })
       continue
     }
     let content: string
     try {
       content = await readFile(abs, "utf-8")
     } catch (err) {
-      skipped.push({ file: rel, reason: unreadableReason(errorCode(err)) })
+      if (ref.explicit) skipped.push({ file: rel, reason: unreadableReason(errorCode(err)) })
       continue
     }
     // Oversize/binario antes de Cuota.
@@ -244,7 +276,7 @@ export async function autoServeMentionedPaths(
     } catch (err) {
       const reason = gateNote(err)
       if (reason === null) throw err
-      skipped.push({ file: rel, reason })
+      if (ref.explicit) skipped.push({ file: rel, reason })
       continue
     }
     // Cuota con holgura: solo sirve si cabe, nunca reclama LRU. Re-servir lo
@@ -284,10 +316,14 @@ export async function autoServeMentionedPaths(
   return { served, skipped }
 }
 
+// Tope de filas inlineadas en la nota (sumando archivos): el head ya resume
+// cada uno; más de 200 filas solo infla el mensaje.
+const MAX_NOTE_ROWS = 200
+
 // Resumen por mensaje: una línea H_ con todo lo auto-servido (adjuntos
 // anotados + mencionados), cada skip motivado y las filas de los
-// mencionados, que no tienen temp donde mostrarse. Null si nada se sirvió
-// ni se saltó.
+// mencionados (hasta MAX_NOTE_ROWS), que no tienen temp donde mostrarse.
+// Null si nada se sirvió ni se saltó.
 export function formatAutoReadNote(
   attachments: AutoServeSummary[],
   mentioned: AutoServeServed[],
@@ -305,8 +341,13 @@ export function formatAutoReadNote(
     )
   }
   const head = `H_AUTO_READ: ${parts.join(" ")}`
-  const sections = mentioned.map(
-    (m) => `${m.file}:\n${m.rows.map((r) => `${r.anchor}│${r.content}`).join("\n")}`,
-  )
+  let remaining = MAX_NOTE_ROWS
+  const sections = mentioned.map((m) => {
+    const shown = m.rows.slice(0, remaining)
+    remaining -= shown.length
+    const body = shown.map((r) => `${r.anchor}│${r.content}`).join("\n")
+    const hidden = m.rows.length - shown.length
+    return `${m.file}:\n${body}${hidden > 0 ? `\n… (+${hidden} line(s) not shown)` : ""}`
+  })
   return `\n${[head, ...sections].join("\n")}`
 }

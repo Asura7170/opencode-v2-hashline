@@ -223,3 +223,19 @@ describe("t12 replace_match por Match literal", () => {
     await cleanup?.()
   })
 })
+
+describe("t12 replace_match y EOL del archivo", () => {
+  test("match multilínea con \\n funciona en archivo CRLF y conserva el CRLF", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\r\nb\r\nc\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const ctx = callCtx("s1", "m1")
+    await tools.get("read").execute({ file: "a.txt" }, ctx)
+    const out = await tools
+      .get("replace_match")
+      .execute({ file: "a.txt", match: "a\nb", content: "X\nY" }, ctx)
+    expect(out.metadata.changed).toBe(true)
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("X\r\nY\r\nc\r\n")
+    await cleanup?.()
+  })
+})

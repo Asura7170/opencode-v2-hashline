@@ -1,14 +1,16 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
   DEFAULT_CONFIG,
+  foldKey,
   globalConfigPath,
   loadHashlineConfig,
   projectConfigPath,
+  relativeKeyFor,
   resolveConfig,
   storePathFor,
 } from "../src/config"
@@ -122,4 +124,52 @@ describe("config precedencia y sanitize", () => {
       loadHashlineConfig({ projectDir: dir, projectPath, globalPath: join(dir, "ng.json") }),
     ).rejects.toThrow(/E_INVALID_CONFIG/)
   })
+})
+
+// Windows sin developer mode: symlinkSync da EPERM/EACCES → se salta el caso.
+function symlinksSupported(): boolean {
+  const dir = mkdtempSync(join(tmpdir(), "t9-link-probe-"))
+  try {
+    writeFileSync(join(dir, "target"), "x")
+    symlinkSync(join(dir, "target"), join(dir, "link"))
+    return true
+  } catch {
+    return false
+  }
+}
+
+const SYMLINKS = symlinksSupported()
+
+describe("foldKey: plegado de case (Windows)", () => {
+  test("foldCase pliega a minúsculas; sin fold no toca la clave", () => {
+    expect(foldKey("Dir/File.TS", true)).toBe("dir/file.ts")
+    expect(foldKey("Dir/File.TS", false)).toBe("Dir/File.TS")
+  })
+})
+
+describe("relativeKeyFor: contención de symlinks", () => {
+  test("archivo dentro → clave relativa normal", () => {
+    const dir = mkdtempSync(join(tmpdir(), "t9-keys-"))
+    writeFileSync(join(dir, "a.txt"), "x")
+    expect(relativeKeyFor(dir, join(dir, "a.txt"))).toBe("a.txt")
+  })
+
+  test.skipIf(!SYMLINKS)("symlink que escapa → null", () => {
+    const outside = mkdtempSync(join(tmpdir(), "t9-keys-out-"))
+    writeFileSync(join(outside, "secret.txt"), "x")
+    const dir = mkdtempSync(join(tmpdir(), "t9-keys-"))
+    symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"))
+    expect(relativeKeyFor(dir, join(dir, "link.txt"))).toBeNull()
+  })
+
+  test.skipIf(!SYMLINKS || process.platform === "win32")(
+    "projectDir symlink: la clave se mide contra el real",
+    () => {
+      const real = mkdtempSync(join(tmpdir(), "t9-keys-real-"))
+      writeFileSync(join(real, "a.txt"), "x")
+      const link = join(mkdtempSync(join(tmpdir(), "t9-keys-link-")), "proj")
+      symlinkSync(real, link)
+      expect(relativeKeyFor(link, join(link, "a.txt"))).toBe("a.txt")
+    },
+  )
 })

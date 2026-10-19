@@ -377,3 +377,29 @@ describe("t15 move: batch y undo por archivo independientes por lado", () => {
     await cleanup?.()
   })
 })
+
+describe("t15 move y EOL del origen", () => {
+  test("vaciar un origen CRLF conserva su EOL", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a1\r\na2\r\na3\r\n")
+    writeFileSync(join(dir, "b.txt"), "b1\n")
+    const { tools, cleanup } = await setup(dir)
+    const ctx = callCtx("s1", "m1")
+    const src = await anchorsOf(tools, "a.txt", ctx)
+    const dst = await anchorsOf(tools, "b.txt", ctx)
+    await move(
+      tools,
+      {
+        file: "a.txt",
+        startAnchor: src[0].anchor,
+        destFile: "b.txt",
+        destAnchor: dst[0].anchor,
+        position: "after",
+      },
+      ctx,
+    )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a2\r\na3\r\n")
+    expect(await readFile(join(dir, "b.txt"), "utf-8")).toBe("b1\na1\n")
+    await cleanup?.()
+  })
+})

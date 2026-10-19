@@ -1,3 +1,4 @@
+import { existsSync, realpathSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -164,15 +165,42 @@ export async function loadHashlineConfig(load: LoadOptions = {}): Promise<Hashli
   return resolveConfig(layers)
 }
 
+// Windows (FS case-insensitive): "A.ts" y "a.ts" son el mismo archivo; sin
+// plegar el case cada capitalización abriría anchors distintos.
+export function foldKey(rel: string, foldCase = process.platform === "win32"): string {
+  return foldCase ? rel.toLowerCase() : rel
+}
+
+// Dentro del proyecto = ni la raíz misma ni un escape (.., ../, absoluto).
+function withinProject(rel: string): boolean {
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
+}
+
+// Clave canónica de un path absoluto dentro del proyecto: contención léxica +
+// real (un symlink/junction interno puede apuntar fuera) + separadores "/" +
+// case plegado. No existente o ENOENT → sin veredicto realpath (el read
+// posterior da E_FILE_NOT_FOUND).
+export function projectKeyFor(projectDir: string, abs: string): string | null {
+  let rel = relative(projectDir, abs)
+  if (!withinProject(rel)) return null
+  if (existsSync(abs)) {
+    try {
+      const realRel = relative(realpathSync(projectDir), realpathSync(abs))
+      if (!withinProject(realRel)) return null
+      rel = realRel
+    } catch (err) {
+      if (errorCode(err) !== "ENOENT") throw err
+    }
+  }
+  return foldKey(rel.split(sep).join("/"))
+}
+
 // Unificación de claves (divergencia #5/#8): la admisión recibe paths absolutos
 // (uris) y los tools claves relativas al proyecto; ambos deben caer al mismo
-// served-record. Dentro del proyecto → relativa con "/" (como los tools);
-// fuera → absoluta normalizada (los tools la rechazan antes del store).
+// served-record. Dentro del proyecto → relativa con "/"; fuera → null.
 export function relativeKeyFor(projectDir: string, fsPath: string): string | null {
   const abs = isAbsolute(fsPath) ? fsPath : resolve(projectDir, fsPath)
-  const rel = relative(projectDir, abs)
-  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null
-  return rel.split(sep).join("/")
+  return projectKeyFor(projectDir, abs)
 }
 
 function keyForFile(projectDir: string, filePath: string): string {

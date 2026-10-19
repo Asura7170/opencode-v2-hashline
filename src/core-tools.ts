@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs"
-import { readFile, writeFile } from "node:fs/promises"
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path"
+import { constants, mkdirSync, realpathSync } from "node:fs"
+import { chmod, copyFile, link, lstat, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { basename, dirname, join, resolve } from "node:path"
 
 import {
   AnchorStoreError,
@@ -18,6 +18,7 @@ import {
 import {
   DEFAULT_CONFIG,
   loadHashlineConfig,
+  projectKeyFor,
   storePathFor as configStorePathFor,
   type HashlineConfig,
 } from "./config"
@@ -65,16 +66,124 @@ function splitLines(content: string): string[] {
   return content.replace(/\r\n/g, "\n").split("\n")
 }
 
+let tmpSeq = 0
+
+// Lost update: el archivo pudo cambiar en disco entre el read de la tool y la
+// escritura; expectedRaw es el contenido crudo (BOM/CRLF incluidos) de ese read.
+// null = el read lo dio por borrado: el archivo debe seguir ausente.
+async function assertUnchanged(
+  abs: string,
+  expectedRaw: string | null | undefined,
+  rel: string,
+): Promise<void> {
+  if (expectedRaw === undefined) return
+  if (expectedRaw === null) {
+    try {
+      await lstat(abs)
+    } catch (err) {
+      if (errorCode(err) === "ENOENT") return
+      throw err
+    }
+    throw changedOnCreate(rel)
+  }
+  let current: string
+  try {
+    current = await readFile(abs, "utf-8")
+  } catch (err) {
+    if (errorCode(err) === "ENOENT") {
+      throw new AnchorStoreError(
+        "E_FILE_CHANGED",
+        `Cambió en disco desde el read: "${rel}" ya no existe; vuelve a leerlo y reintenta`,
+      )
+    }
+    throw err
+  }
+  if (current !== expectedRaw) {
+    throw new AnchorStoreError(
+      "E_FILE_CHANGED",
+      `Cambió en disco desde el read: "${rel}"; vuelve a leerlo y reintenta`,
+    )
+  }
+}
+
+// Escritura atómica: temporal en el mismo directorio + rename (mismo filesystem).
+// Symlink: escribe el target real (rename reemplazaría el enlace). Modo: el
+// inodo nuevo hereda el del destino para no perderlo (p.ej. 0o755).
+// La comprobación anti lost-update corre justo antes del rename; el temporal
+// ya escrito se borra si falla. expectedRaw null = recrear un borrado: link (o
+// copyFile EXCL) sin sobrescribir una creación concurrente.
+async function writeAtomic(
+  abs: string,
+  content: string,
+  expectedRaw: string | null | undefined,
+  rel: string,
+): Promise<void> {
+  let target = abs
+  try {
+    if ((await lstat(abs)).isSymbolicLink()) target = realpathSync(abs)
+  } catch (err) {
+    if (errorCode(err) !== "ENOENT") throw err
+  }
+  const tmp = join(dirname(target), `.${basename(target)}.${process.pid}.${++tmpSeq}.tmp`)
+  try {
+    await writeFile(tmp, content, "utf-8")
+    try {
+      await chmod(tmp, (await stat(target)).mode)
+    } catch (err) {
+      if (errorCode(err) !== "ENOENT") throw err
+    }
+    // shortcut: la ventana check→rename no es cero sin CAS/lock.
+    await assertUnchanged(abs, expectedRaw, rel)
+    if (expectedRaw === null) {
+      try {
+        await link(tmp, target)
+      } catch (err) {
+        const code = errorCode(err)
+        if (code === "EEXIST") throw changedOnCreate(rel)
+        if (
+          code !== "EPERM" &&
+          code !== "EACCES" &&
+          code !== "ENOSYS" &&
+          code !== "ENOTSUP" &&
+          code !== "EXDEV" &&
+          code !== "EMLINK"
+        ) {
+          throw err
+        }
+        try {
+          await copyFile(tmp, target, constants.COPYFILE_EXCL)
+        } catch (copyErr) {
+          if (errorCode(copyErr) === "EEXIST") throw changedOnCreate(rel)
+          throw copyErr
+        }
+      }
+      await rm(tmp, { force: true }).catch(() => {})
+    } else {
+      await rename(tmp, target)
+    }
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
+}
+
+function changedOnCreate(rel: string): AnchorStoreError {
+  return new AnchorStoreError(
+    "E_FILE_CHANGED",
+    `Cambió en disco desde el read: "${rel}" apareció (ya existe); vuelve a leerlo y reintenta`,
+  )
+}
+
 function resolveInProject(projectDir: string, file: unknown): { abs: string; rel: string } {
   if (typeof file !== "string" || file.length === 0) {
     throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro file requerido (string no vacío)")
   }
   const abs = resolve(projectDir, file)
-  const rel = relative(projectDir, abs)
-  if (rel === "" || rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
+  const rel = projectKeyFor(projectDir, abs)
+  if (rel === null) {
     throw new AnchorStoreError("E_PATH_EXCLUDED", `Path fuera del proyecto: "${file}"`)
   }
-  return { abs, rel: rel.split(sep).join("/") }
+  return { abs, rel }
 }
 
 // Args de copy/move (#13/#15): mismo contrato validado una sola vez.
@@ -222,9 +331,18 @@ function parseLimit(limit: unknown, maxOutputLines: number): number {
   return Math.min(limit, maxOutputLines)
 }
 
-async function readDisk(abs: string, rel: string): Promise<string> {
+interface DiskFile {
+  text: string
+  eol: "\n" | "\r\n"
+  bom: boolean
+  /** Contenido exacto de readFile, antes de quitar BOM o normalizar CRLF. */
+  raw: string
+}
+
+async function readDisk(abs: string, rel: string): Promise<DiskFile> {
+  let raw: string
   try {
-    return await readFile(abs, "utf-8")
+    raw = await readFile(abs, "utf-8")
   } catch (err) {
     if (errorCode(err) === "ENOENT") {
       throw new AnchorStoreError("E_FILE_NOT_FOUND", `No existe: "${rel}"`)
@@ -234,6 +352,15 @@ async function readDisk(abs: string, rel: string): Promise<string> {
     }
     throw err
   }
+  const bom = raw.startsWith("\uFEFF")
+  const body = bom ? raw.slice(1) : raw
+  const crlf = body.match(/\r\n/g)?.length ?? 0
+  const lf = (body.match(/\n/g)?.length ?? 0) - crlf
+  return { text: body.replace(/\r\n/g, "\n"), eol: crlf > lf ? "\r\n" : "\n", bom, raw }
+}
+
+function serialize(lines: string[], meta: { eol: "\n" | "\r\n"; bom: boolean }): string {
+  return `${meta.bom ? "\uFEFF" : ""}${lines.join(meta.eol)}`
 }
 
 export interface CoreToolsDeps {
@@ -328,7 +455,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const { abs, rel } = resolveInProject(projectDir, input?.file)
     const disk = await readDisk(abs, rel)
     const store = storeFor(context.sessionID)
-    const served = store.serve(rel, disk)
+    const served = store.serve(rel, disk.text)
     let startLine: number
     try {
       startLine = parseOffset(input?.offset, (anchor) => store.resolve(rel, anchor).line)
@@ -358,7 +485,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     assertBatchOpen(batch, rel)
     const disk = await tracked(batch, rel, () => readDisk(abs, rel))
     const store = storeFor(context.sessionID)
-    const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk).rows)
+    const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk.text).rows)
     // Pre-commit: los mismos anchors originales reintentados son solape,
     // no stale (el resolve posterior fallaría con E_ANCHOR_STALE).
     assertDisjoint(batch, rel, [startAnchor, endAnchor ?? startAnchor], `rango ${startAnchor}-${endAnchor ?? startAnchor}`)
@@ -377,7 +504,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       preAnchors,
       `rango ${startAnchor}-${endAnchor ?? startAnchor}`,
     )
-    const diskLines = splitLines(disk)
+    const diskLines = splitLines(disk.text)
     const newLines = splitLines(content)
     const oldSlice = diskLines.slice(range.startLine - 1, range.endLine)
     if (oldSlice.length === newLines.length && oldSlice.every((l, i) => l === newLines[i])) {
@@ -391,10 +518,11 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       ...newLines,
       ...diskLines.slice(range.endLine),
     ].join("\n")
+    const finalContent = serialize(splitLines(newContent), disk)
     await tracked(batch, rel, async () => {
-      checkNewContent(rel, newContent, cfg.maxFileBytes)
+      checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent, disk.raw, rel))
     const committed = await tracked(batch, rel, () =>
       // Continuación de batch: un solo undo por mensaje (sombra del primero).
       Promise.resolve(
@@ -457,14 +585,14 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     assertBatchOpen(batch, rel)
     const disk = await tracked(batch, rel, () => readDisk(abs, rel))
     const store = storeFor(context.sessionID)
-    const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk).rows)
+    const oldRows = await tracked(batch, rel, async () => store.serve(rel, disk.text).rows)
     // Conteo literal case-sensitive sobre lo servido (paso +1: los
     // solapes también cuentan como ambigüedad).
     let count = 0
-    let at = disk.indexOf(match)
+    let at = disk.text.indexOf(match)
     while (at >= 0) {
       count++
-      at = disk.indexOf(match, at + 1)
+      at = disk.text.indexOf(match, at + 1)
     }
     if (count !== 1) {
       throw new AnchorStoreError(
@@ -474,22 +602,23 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
           : `Match ambiguo en "${rel}": ${JSON.stringify(match.slice(0, 120))} (${count} ocurrencias; sin escritura)`,
       )
     }
-    const idx = disk.indexOf(match)
-    const startLine = disk.slice(0, idx).split("\n").length
-    const endLine = disk.slice(0, idx + match.length).split("\n").length
+    const idx = disk.text.indexOf(match)
+    const startLine = disk.text.slice(0, idx).split("\n").length
+    const endLine = disk.text.slice(0, idx + match.length).split("\n").length
     const preAnchors = oldRows.slice(startLine - 1, endLine).map((r) => r.anchor)
     assertDisjoint(batch, rel, preAnchors, `match ${JSON.stringify(match.slice(0, 60))}`)
-    const newContent = disk.slice(0, idx) + content + disk.slice(idx + match.length)
-    if (newContent === disk) {
+    const newContent = disk.text.slice(0, idx) + content + disk.text.slice(idx + match.length)
+    if (newContent === disk.text) {
       return {
         content: `H_NOOP: no changes to ${rel} (match already matches).`,
         metadata: { changed: false, file: rel, startLine, endLine },
       }
     }
+    const finalContent = serialize(splitLines(newContent), disk)
     await tracked(batch, rel, async () => {
-      checkNewContent(rel, newContent, cfg.maxFileBytes)
+      checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent, disk.raw, rel))
     const committed = await tracked(batch, rel, () =>
       // Continuación de batch: un solo undo por mensaje (sombra del primero).
       Promise.resolve(
@@ -551,7 +680,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const disk = await tracked(batch, rel, () => readDisk(abs, rel))
     const store = storeFor(context.sessionID)
     await tracked(batch, rel, async () => {
-      store.serve(rel, disk)
+      store.serve(rel, disk.text)
     })
     let resolved
     // Pre-commit: reinsertar sobre el mismo anchor del batch es solape,
@@ -563,14 +692,15 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
       throw err
     }
-    const diskLines = splitLines(disk)
+    const diskLines = splitLines(disk.text)
     const newLines = splitLines(content)
     const idx = position === "before" ? resolved.line - 1 : resolved.line
     const newContent = [...diskLines.slice(0, idx), ...newLines, ...diskLines.slice(idx)].join("\n")
+    const finalContent = serialize(splitLines(newContent), disk)
     await tracked(batch, rel, async () => {
-      checkNewContent(rel, newContent, cfg.maxFileBytes)
+      checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeFile(abs, newContent, "utf-8"))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent, disk.raw, rel))
     const committed = await tracked(batch, rel, () =>
       Promise.resolve(
         batch && batch.commits > 0
@@ -606,12 +736,12 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     store: AnchorStore,
     batchSrc: BatchState | null,
     srcRel: string,
-    srcDisk: string,
+    srcDisk: DiskFile,
     startAnchor: string,
     endAnchor: string | undefined,
     label: string,
   ): Promise<{ srcRange: ResolvedRange; preAnchors: string[] }> {
-    const srcRows = await tracked(batchSrc, srcRel, async () => store.serve(srcRel, srcDisk).rows)
+    const srcRows = await tracked(batchSrc, srcRel, async () => store.serve(srcRel, srcDisk.text).rows)
     const where = `${label} origen ${startAnchor}-${endAnchor ?? startAnchor}`
     // Pre-commit: re-copiar el mismo rango del batch es solape, no stale.
     assertDisjoint(batchSrc, srcRel, [startAnchor, endAnchor ?? startAnchor], where)
@@ -629,8 +759,8 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
 
   // Camino de commit a destino compartido por copy (#13) y move (#15):
   // serve + resolve del punto, foto, cómputo, pre-escritura, write y commit.
-  // Sin marcado de batch: cada llamador marca al final (move vacía el
-  // origen entre el commit y el marcado sin auto-solaparse).
+  // Sin marcado de batch: cada llamador marca su nivel de undo tras el
+  // commit (move lo hace antes de vaciar el origen, para no perderlo si falla).
   async function commitDestCopy(
     store: AnchorStore,
     batchDst: BatchState | null,
@@ -651,7 +781,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       )
     }
     await tracked(batchDst, dstRel, async () => {
-      store.serve(dstRel, dstDisk)
+      store.serve(dstRel, dstDisk.text)
     })
     // Pre-commit: re-copiar sobre el mismo punto de destino es solape.
     assertDisjoint(batchDst, dstRel, [destAnchor], `destino en "${destAnchor}"`)
@@ -662,13 +792,14 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
       throw err
     }
-    const dstLines = splitLines(dstDisk)
+    const dstLines = splitLines(dstDisk.text)
     const idx = position === "before" ? dstResolved.line - 1 : dstResolved.line
     const newContent = [...dstLines.slice(0, idx), ...srcLines, ...dstLines.slice(idx)].join("\n")
+    const finalContent = serialize(splitLines(newContent), dstDisk)
     await tracked(batchDst, dstRel, async () => {
-      checkNewContent(dstRel, newContent, cfg.maxFileBytes)
+      checkNewContent(dstRel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batchDst, dstRel, () => writeFile(dstAbs, newContent, "utf-8"))
+    await tracked(batchDst, dstRel, () => writeAtomic(dstAbs, finalContent, dstDisk.raw, dstRel))
     const committed = await tracked(batchDst, dstRel, () =>
       Promise.resolve(
         batchDst && batchDst.commits > 0
@@ -706,7 +837,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       "copy",
     )
     // Foto pre-escritura: el mismo-archivo copia duplicando, nunca mezcla.
-    const srcLines = splitLines(srcDisk).slice(srcRange.startLine - 1, srcRange.endLine)
+    const srcLines = splitLines(srcDisk.text).slice(srcRange.startLine - 1, srcRange.endLine)
     // Commit a destino por el camino compartido con move (#15).
     const { committed, dstResolved, idx } = await commitDestCopy(
       store,
@@ -774,7 +905,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       endAnchor,
       "move",
     )
-    const srcLines = splitLines(srcDisk).slice(srcRange.startLine - 1, srcRange.endLine)
+    const srcLines = splitLines(srcDisk.text).slice(srcRange.startLine - 1, srcRange.endLine)
 
     if (srcRel === dstRel) {
       // Mismo archivo: quitar-y-poner en un solo commit (un batch, un undo).
@@ -788,7 +919,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
         if (err instanceof StaleAnchorError) throw withCurrentRows(err, cfg.maxLineChars)
         throw err
       }
-      const all = splitLines(srcDisk)
+      const all = splitLines(srcDisk.text)
       const n = srcLines.length
       const idx = position === "before" ? dstResolved.line - 1 : dstResolved.line
       // Punto de inserción tras quitar el rango: antes, después o dentro
@@ -801,7 +932,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
             : srcRange.startLine - 1
       const rest = [...all.slice(0, srcRange.startLine - 1), ...all.slice(srcRange.endLine)]
       const newContent = [...rest.slice(0, at), ...srcLines, ...rest.slice(at)].join("\n")
-      if (newContent === srcDisk) {
+      if (newContent === srcDisk.text) {
         return {
           content: `H_NOOP: no changes to ${srcRel} (move already in place).`,
           metadata: {
@@ -812,10 +943,11 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
           },
         }
       }
+      const finalContent = serialize(splitLines(newContent), srcDisk)
       await tracked(batchSrc, srcRel, async () => {
-        checkNewContent(srcRel, newContent, cfg.maxFileBytes)
+        checkNewContent(srcRel, finalContent, cfg.maxFileBytes)
       })
-      await tracked(batchSrc, srcRel, () => writeFile(srcAbs, newContent, "utf-8"))
+      await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalContent, srcDisk.raw, srcRel))
       const committed = await tracked(batchSrc, srcRel, () =>
         Promise.resolve(
           batchSrc && batchSrc.commits > 0
@@ -851,17 +983,30 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
 
     // Dos archivos: el destino commitea PRIMERO por el camino de copy; el
-    // origen se vacía solo entonces, en el mismo mensaje.
+    // origen se vacía solo entonces, en el mismo mensaje. El pre-check detecta
+    // cambios del origen antes de tocar el destino; si cambia entre el commit
+    // del destino y el vaciado el resultado es duplicado (destino escrito,
+    // origen intacto), nunca pérdida.
+    await assertUnchanged(srcAbs, srcDisk.raw, srcRel)
     const dest = await commitDestCopy(store, batchDst, dstAbs, dstRel, destAnchor, position, srcLines)
     const { committed, dstResolved, idx } = dest
+    // Nivel de undo del destino antes de vaciar el origen: si el vaciado
+    // falla, el siguiente edit del destino sigue conservando la sombra.
+    if (batchDst) {
+      batchDst.commits++
+      batchDst.touched.add(destAnchor)
+      for (const r of committed.rows.slice(idx, idx + srcLines.length))
+        batchDst.touched.add(r.anchor)
+    }
     // Vaciado del origen ANTES del marcado de preAnchors (aviso #13): toca el
     // mismo rango a propósito y bypassea disjoint (ya verificado arriba).
     // Subconjunto del contenido: sin checkNewContent (solo encoge).
     const emptied = [
-      ...splitLines(srcDisk).slice(0, srcRange.startLine - 1),
-      ...splitLines(srcDisk).slice(srcRange.endLine),
+      ...splitLines(srcDisk.text).slice(0, srcRange.startLine - 1),
+      ...splitLines(srcDisk.text).slice(srcRange.endLine),
     ].join("\n")
-    await tracked(batchSrc, srcRel, () => writeFile(srcAbs, emptied, "utf-8"))
+    const finalEmptied = serialize(splitLines(emptied), srcDisk)
+    await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalEmptied, srcDisk.raw, srcRel))
     const srcCommitted = await tracked(batchSrc, srcRel, () =>
       Promise.resolve(
         batchSrc && batchSrc.commits > 0
@@ -869,12 +1014,6 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
           : store.commit(srcRel, emptied),
       ),
     )
-    if (batchDst) {
-      batchDst.commits++
-      batchDst.touched.add(destAnchor)
-      for (const r of committed.rows.slice(idx, idx + srcLines.length))
-        batchDst.touched.add(r.anchor)
-    }
     if (batchSrc) {
       batchSrc.commits++
       for (const a of preAnchors) batchSrc.touched.add(a)
@@ -908,17 +1047,37 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
     let diskLines: string[] | null
+    let diskRaw: string | undefined
+    let diskMeta: { eol: "\n" | "\r\n"; bom: boolean } = { eol: "\n", bom: false }
     try {
-      diskLines = splitLines(await readDisk(abs, rel))
+      const disk = await readDisk(abs, rel)
+      diskLines = splitLines(disk.text)
+      diskMeta = disk
+      diskRaw = disk.raw
     } catch (err) {
       // Archivo borrado tras el edit: se recrea desde la sombra.
       if (err instanceof AnchorStoreError && err.code === "E_FILE_NOT_FOUND") diskLines = null
       else throw err
     }
     const store = storeFor(context.sessionID)
+    const beforeRestore = store.peek(rel)
     const restored = store.restoreShadow(rel, diskLines)
-    const newContent = restored.rows.map((r) => r.content).join("\n")
-    await writeFile(abs, newContent, "utf-8")
+    const restoredLines = restored.rows.map((r) => r.content)
+    try {
+      // shortcut: al recrear se pierde el EOL/BOM original (la sombra solo guarda contenido).
+      await writeAtomic(abs, serialize(restoredLines, diskMeta), diskLines === null ? null : diskRaw, rel)
+    } catch (err) {
+      // restoreShadow ya consumió la sombra; si la escritura falla, commit
+      // devuelve el estado pre-undo y la sombra disponible.
+      const rollbackContent =
+        diskLines !== null ? diskLines.join("\n") : beforeRestore?.map((r) => r.content).join("\n")
+      if (rollbackContent !== undefined) {
+        try {
+          store.commit(rel, rollbackContent)
+        } catch {}
+      }
+      throw err
+    }
     // El undo cierra los batches abiertos de este archivo: el próximo edit
     // abre un nivel de undo fresco.
     const sessionID = context?.sessionID

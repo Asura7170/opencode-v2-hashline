@@ -63,7 +63,7 @@ describe("tope 10 por mensaje #21", () => {
     const store = memStore()
     const proj = withProjectKeys(store, dir)
     // Skips del Gate intercalados: fuera del proyecto al inicio, excluido al final.
-    const text = `../fuera.txt ${names.join(" ")} package-lock.json`
+    const text = `@../fuera.txt ${names.join(" ")} @package-lock.json`
     writeFileSync(join(dir, "package-lock.json"), "x\ny")
     const { served, skipped } = await autoServeMentionedPaths(text, dir, proj)
     // Los 10 primeros válidos se sirven aunque haya skips entre medias.

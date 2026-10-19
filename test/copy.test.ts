@@ -426,3 +426,30 @@ describe("t13 copy: batch y undo por archivo independientes por lado", () => {
     await cleanup?.()
   })
 })
+
+describe("t13 copy y EOL del destino", () => {
+  test("destino CRLF con BOM conserva ambos al copiar", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a1\na2")
+    writeFileSync(join(dir, "b.txt"), "\uFEFFb1\r\nb2\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const ctx = callCtx("s1", "m1")
+    const src = await anchorsOf(tools, "a.txt", ctx)
+    const dst = await anchorsOf(tools, "b.txt", ctx)
+    await tools
+      .get("copy")
+      .execute(
+        {
+          file: "a.txt",
+          startAnchor: src[0].anchor,
+          endAnchor: src[1].anchor,
+          destFile: "b.txt",
+          destAnchor: dst[0].anchor,
+          position: "after",
+        },
+        ctx,
+      )
+    expect(await readFile(join(dir, "b.txt"), "utf-8")).toBe("\uFEFFb1\r\na1\r\na2\r\nb2\r\n")
+    await cleanup?.()
+  })
+})

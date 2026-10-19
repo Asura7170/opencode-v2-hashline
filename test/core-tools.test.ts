@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, writeFileSync } from "node:fs"
-import { stat } from "node:fs/promises"
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from "node:fs"
+import { readFile, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -12,6 +12,20 @@ const ROW_RE = /^[a-z]{4}│/
 function project() {
   return mkdtempSync(join(tmpdir(), "t5-"))
 }
+
+// Windows sin developer mode: symlinkSync da EPERM/EACCES → se salta el caso.
+function symlinksSupported(): boolean {
+  const dir = mkdtempSync(join(tmpdir(), "t5-link-probe-"))
+  try {
+    writeFileSync(join(dir, "target"), "x")
+    symlinkSync(join(dir, "target"), join(dir, "link"))
+    return true
+  } catch {
+    return false
+  }
+}
+
+const SYMLINKS = symlinksSupported()
 
 function makeCtx(projectDir: string) {
   const tools = new Map<string, any>()
@@ -150,6 +164,18 @@ describe("t5 read (override nativo)", () => {
     ).rejects.toThrow(/E_FILE_NOT_FOUND/)
     await cleanup?.()
   })
+
+  test.skipIf(!SYMLINKS)("symlink que escapa del proyecto → E_PATH_EXCLUDED", async () => {
+    const outside = project()
+    writeFileSync(join(outside, "secret.txt"), "secret")
+    const dir = project()
+    symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"))
+    const { tools, cleanup } = await setup(dir)
+    await expect(
+      tools.get("read").execute({ file: "link.txt" }, callCtx()),
+    ).rejects.toThrow(/E_PATH_EXCLUDED/)
+    await cleanup?.()
+  })
 })
 
 describe("t5 replace por anchor", () => {
@@ -234,6 +260,79 @@ describe("t5 replace por anchor", () => {
     expect(after.map((r) => r.anchor)).toEqual(before.map((r) => r.anchor))
     await cleanup?.()
   })
+
+  test("escritura atómica: replace no deja temporales", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\nb\nc")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\nB\nc")
+    expect(readdirSync(dir).filter((n) => n.endsWith(".tmp"))).toEqual([])
+    await cleanup?.()
+  })
+
+  // Windows: chmod solo toca el bit de escritura; el modo POSIX no es fiable.
+  test.skipIf(process.platform === "win32")("escritura atómica conserva el modo 0o755", async () => {
+    const dir = project()
+    const file = join(dir, "run.sh")
+    writeFileSync(file, "#!/bin/sh\necho a\n")
+    chmodSync(file, 0o755)
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "run.sh" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "run.sh", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "echo b" },
+        callCtx(),
+      )
+    expect((await stat(file)).mode & 0o777).toBe(0o755)
+    await cleanup?.()
+  })
+
+  test.skipIf(!SYMLINKS)("editar vía symlink interno conserva el enlace y escribe el target", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "target.txt"), "a\nb\nc")
+    symlinkSync(join(dir, "target.txt"), join(dir, "link.txt"))
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "link.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "link.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "target.txt"), "utf-8")).toBe("a\nB\nc")
+    expect(lstatSync(join(dir, "link.txt")).isSymbolicLink()).toBe(true)
+    await cleanup?.()
+  })
+
+  // Windows (FS case-insensitive): la clave de proyecto pliega el case, así que
+  // read y replace con distinta capitalización comparten el mismo anchor set.
+  test.skipIf(process.platform !== "win32")(
+    "case-insensitive: replace con otra capitalización usa los anchors del read",
+    async () => {
+      const dir = project()
+      writeFileSync(join(dir, "MixedCase.txt"), "one\ntwo\nthree")
+      const { tools, cleanup } = await setup(dir)
+      const before = rowsOf(
+        (await tools.get("read").execute({ file: "mixedcase.txt" }, callCtx())).content,
+      )
+      await tools
+        .get("replace")
+        .execute(
+          { file: "MIXEDCASE.TXT", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "TWO" },
+          callCtx(),
+        )
+      expect(await readFile(join(dir, "MixedCase.txt"), "utf-8")).toBe("one\nTWO\nthree")
+      await cleanup?.()
+    },
+  )
 })
 
 describe("t5 insert por anchor", () => {
@@ -368,6 +467,65 @@ describe("t10 contrato de registro con el host (e2e 2.0.26)", () => {
     ]) {
       expect(tools.get(name)?.options).toEqual({ codemode: false })
     }
+    await cleanup?.()
+  })
+})
+
+describe("t5 EOL y BOM: solo cambian las líneas ancladas", () => {
+  test("replace en archivo CRLF conserva el CRLF del resto", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\r\nb\r\nc\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\r\nB\r\nc\r\n")
+    await cleanup?.()
+  })
+
+  test("replace conserva el BOM inicial y el CRLF", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "\uFEFFa\r\nb\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("\uFEFFa\r\nB\r\n")
+    await cleanup?.()
+  })
+
+  test("insert en archivo CRLF mantiene el CRLF", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\r\nc\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("insert")
+      .execute({ file: "a.txt", anchor: before[0].anchor, position: "after", content: "b" }, callCtx())
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\r\nb\r\nc\r\n")
+    await cleanup?.()
+  })
+
+  test("archivo LF sigue escribiendo LF (sin regresión)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\nb\nc\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\nB\nc\n")
     await cleanup?.()
   })
 })

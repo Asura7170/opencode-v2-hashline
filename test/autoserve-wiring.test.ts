@@ -165,7 +165,7 @@ describe("t19 auto-serve por hook", () => {
     // Cuota para 2 anchors: ok.txt cabe, nuevo.txt ya no.
     const { ctx, tools, hooks } = makeCtx(dir, { maxAnchors: 2 })
     const cleanup = (await plugin.setup(ctx)) as () => Promise<void>
-    const prompt = await promptOf(hooks, "s5", { text: "revisa ok.txt nuevo.txt y ../fuera.txt" })
+    const prompt = await promptOf(hooks, "s5", { text: "revisa ok.txt nuevo.txt y @../fuera.txt" })
     expect(prompt.text).toMatch(/H_AUTO_READ/)
     expect(prompt.text).toContain("ok.txt (2 lines)")
     expect(prompt.text).toMatch(/nuevo\.txt.*[Cc]uota/)
@@ -195,7 +195,7 @@ describe("t19 auto-serve por hook", () => {
     try {
       const { ctx, hooks } = makeCtx(dir)
       const cleanup = (await plugin.setup(ctx)) as () => Promise<void>
-      const prompt = await promptOf(hooks, "s6", { text: "revisa locked.txt" })
+      const prompt = await promptOf(hooks, "s6", { text: "revisa @locked.txt" })
       expect(prompt.text).toMatch(/H_AUTO_READ/)
       expect(prompt.text).toContain("locked.txt")
       expect(prompt.text).toMatch(/permiso/)
