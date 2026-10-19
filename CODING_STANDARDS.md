@@ -6,3 +6,4 @@ Read during review, not implementation. Judgement calls no guardrail can enforce
 - A failed edit never mutates served-record: peek before serve, so stale surfaces before any write or serve side effect.
 - Every skip path emits its reason into the per-message summary: no silent `catch { continue }` in gate paths.
 - Gate checks run cheapest-first (excludes/oversize before quota), so the reported reason is the most relevant one.
+- Unit tests replicate the production geometry (one sidecar per session): a rule tested only under a shared-store fixture with foreign rows pre-seeded can pass while its production branch never fires.

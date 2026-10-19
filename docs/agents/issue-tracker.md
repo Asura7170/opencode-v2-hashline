@@ -16,6 +16,8 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 `gh issue create` has no `--json`: parse the number from the printed URL. Multi-line bodies go via `--body-file`; one-line `--body` uses single quotes and ASCII only (backticks break argument parsing).
 
+Native CLIs under pwsh re-wrap arguments with spaces, leaking literal `"` into them (observed with `opencode run 'message'` — the prompt arrived quote-wrapped and hashline's quoted-segment extractor disabled its own auto-serve). To pass a multi-word prompt/arg faithfully, splat it word-by-word: build an array of space-free strings and pass `@array` — variadic CLIs join with spaces and each arg needs no re-wrap.
+
 Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
 
 ## Pull requests as a triage surface
