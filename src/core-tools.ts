@@ -68,10 +68,46 @@ function splitLines(content: string): string[] {
 
 let tmpSeq = 0
 
+// Lost update: el archivo pudo cambiar en disco entre el read de la tool y la
+// escritura; expectedRaw es el contenido crudo (BOM/CRLF incluidos) de ese read.
+async function assertUnchanged(
+  abs: string,
+  expectedRaw: string | undefined,
+  rel: string,
+): Promise<void> {
+  if (expectedRaw === undefined) return
+  let current: string
+  try {
+    current = await readFile(abs, "utf-8")
+  } catch (err) {
+    if (errorCode(err) === "ENOENT") {
+      throw new AnchorStoreError(
+        "E_FILE_CHANGED",
+        `Cambió en disco desde el read: "${rel}" ya no existe; vuelve a leerlo y reintenta`,
+      )
+    }
+    throw err
+  }
+  if (current !== expectedRaw) {
+    throw new AnchorStoreError(
+      "E_FILE_CHANGED",
+      `Cambió en disco desde el read: "${rel}"; vuelve a leerlo y reintenta`,
+    )
+  }
+}
+
 // Escritura atómica: temporal en el mismo directorio + rename (mismo filesystem).
 // Symlink: escribe el target real (rename reemplazaría el enlace). Modo: el
 // inodo nuevo hereda el del destino para no perderlo (p.ej. 0o755).
-async function writeAtomic(abs: string, content: string): Promise<void> {
+// La comprobación anti lost-update va ANTES de crear el temporal; sin
+// expectedRaw no hay chequeo (undo que recrea un archivo borrado pasa undefined).
+async function writeAtomic(
+  abs: string,
+  content: string,
+  expectedRaw: string | undefined,
+  rel: string,
+): Promise<void> {
+  await assertUnchanged(abs, expectedRaw, rel)
   let target = abs
   try {
     if ((await lstat(abs)).isSymbolicLink()) target = realpathSync(abs)
@@ -257,6 +293,8 @@ interface DiskFile {
   text: string
   eol: "\n" | "\r\n"
   bom: boolean
+  /** Contenido exacto de readFile, antes de quitar BOM o normalizar CRLF. */
+  raw: string
 }
 
 async function readDisk(abs: string, rel: string): Promise<DiskFile> {
@@ -276,7 +314,7 @@ async function readDisk(abs: string, rel: string): Promise<DiskFile> {
   const body = bom ? raw.slice(1) : raw
   const crlf = body.match(/\r\n/g)?.length ?? 0
   const lf = (body.match(/\n/g)?.length ?? 0) - crlf
-  return { text: body.replace(/\r\n/g, "\n"), eol: crlf > lf ? "\r\n" : "\n", bom }
+  return { text: body.replace(/\r\n/g, "\n"), eol: crlf > lf ? "\r\n" : "\n", bom, raw }
 }
 
 function serialize(lines: string[], meta: { eol: "\n" | "\r\n"; bom: boolean }): string {
@@ -442,7 +480,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batch, rel, async () => {
       checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeAtomic(abs, finalContent))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent, disk.raw, rel))
     const committed = await tracked(batch, rel, () =>
       // Continuación de batch: un solo undo por mensaje (sombra del primero).
       Promise.resolve(
@@ -538,7 +576,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batch, rel, async () => {
       checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeAtomic(abs, finalContent))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent, disk.raw, rel))
     const committed = await tracked(batch, rel, () =>
       // Continuación de batch: un solo undo por mensaje (sombra del primero).
       Promise.resolve(
@@ -620,7 +658,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batch, rel, async () => {
       checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeAtomic(abs, finalContent))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent, disk.raw, rel))
     const committed = await tracked(batch, rel, () =>
       Promise.resolve(
         batch && batch.commits > 0
@@ -719,7 +757,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batchDst, dstRel, async () => {
       checkNewContent(dstRel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batchDst, dstRel, () => writeAtomic(dstAbs, finalContent))
+    await tracked(batchDst, dstRel, () => writeAtomic(dstAbs, finalContent, dstDisk.raw, dstRel))
     const committed = await tracked(batchDst, dstRel, () =>
       Promise.resolve(
         batchDst && batchDst.commits > 0
@@ -867,7 +905,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       await tracked(batchSrc, srcRel, async () => {
         checkNewContent(srcRel, finalContent, cfg.maxFileBytes)
       })
-      await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalContent))
+      await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalContent, srcDisk.raw, srcRel))
       const committed = await tracked(batchSrc, srcRel, () =>
         Promise.resolve(
           batchSrc && batchSrc.commits > 0
@@ -903,7 +941,11 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     }
 
     // Dos archivos: el destino commitea PRIMERO por el camino de copy; el
-    // origen se vacía solo entonces, en el mismo mensaje.
+    // origen se vacía solo entonces, en el mismo mensaje. El pre-check detecta
+    // cambios del origen antes de tocar el destino; si cambia entre el commit
+    // del destino y el vaciado el resultado es duplicado (destino escrito,
+    // origen intacto), nunca pérdida.
+    await assertUnchanged(srcAbs, srcDisk.raw, srcRel)
     const dest = await commitDestCopy(store, batchDst, dstAbs, dstRel, destAnchor, position, srcLines)
     const { committed, dstResolved, idx } = dest
     // Vaciado del origen ANTES del marcado de preAnchors (aviso #13): toca el
@@ -914,7 +956,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       ...splitLines(srcDisk.text).slice(srcRange.endLine),
     ].join("\n")
     const finalEmptied = serialize(splitLines(emptied), srcDisk)
-    await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalEmptied))
+    await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalEmptied, srcDisk.raw, srcRel))
     const srcCommitted = await tracked(batchSrc, srcRel, () =>
       Promise.resolve(
         batchSrc && batchSrc.commits > 0
@@ -961,11 +1003,13 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const input: ToolCallInput = (rawInput ?? {}) as ToolCallInput
     const { abs, rel } = resolveInProject(projectDir, input?.file)
     let diskLines: string[] | null
+    let diskRaw: string | undefined
     let diskMeta: { eol: "\n" | "\r\n"; bom: boolean } = { eol: "\n", bom: false }
     try {
       const disk = await readDisk(abs, rel)
       diskLines = splitLines(disk.text)
       diskMeta = disk
+      diskRaw = disk.raw
     } catch (err) {
       // Archivo borrado tras el edit: se recrea desde la sombra.
       if (err instanceof AnchorStoreError && err.code === "E_FILE_NOT_FOUND") diskLines = null
@@ -974,7 +1018,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const store = storeFor(context.sessionID)
     const restored = store.restoreShadow(rel, diskLines)
     const restoredLines = restored.rows.map((r) => r.content)
-    await writeAtomic(abs, serialize(restoredLines, diskMeta))
+    await writeAtomic(abs, serialize(restoredLines, diskMeta), diskRaw, rel)
     // El undo cierra los batches abiertos de este archivo: el próximo edit
     // abre un nivel de undo fresco.
     const sessionID = context?.sessionID
