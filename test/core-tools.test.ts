@@ -311,6 +311,28 @@ describe("t5 replace por anchor", () => {
     expect(lstatSync(join(dir, "link.txt")).isSymbolicLink()).toBe(true)
     await cleanup?.()
   })
+
+  // Windows (FS case-insensitive): la clave de proyecto pliega el case, así que
+  // read y replace con distinta capitalización comparten el mismo anchor set.
+  test.skipIf(process.platform !== "win32")(
+    "case-insensitive: replace con otra capitalización usa los anchors del read",
+    async () => {
+      const dir = project()
+      writeFileSync(join(dir, "MixedCase.txt"), "one\ntwo\nthree")
+      const { tools, cleanup } = await setup(dir)
+      const before = rowsOf(
+        (await tools.get("read").execute({ file: "mixedcase.txt" }, callCtx())).content,
+      )
+      await tools
+        .get("replace")
+        .execute(
+          { file: "MIXEDCASE.TXT", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "TWO" },
+          callCtx(),
+        )
+      expect(await readFile(join(dir, "MixedCase.txt"), "utf-8")).toBe("one\nTWO\nthree")
+      await cleanup?.()
+    },
+  )
 })
 
 describe("t5 insert por anchor", () => {

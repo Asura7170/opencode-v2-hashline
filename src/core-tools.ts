@@ -1,6 +1,6 @@
 import { mkdirSync, realpathSync } from "node:fs"
 import { chmod, lstat, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 
 import {
   AnchorStoreError,
@@ -17,8 +17,8 @@ import {
 
 import {
   DEFAULT_CONFIG,
-  escapesProjectByRealpath,
   loadHashlineConfig,
+  projectKeyFor,
   storePathFor as configStorePathFor,
   type HashlineConfig,
 } from "./config"
@@ -134,14 +134,11 @@ function resolveInProject(projectDir: string, file: unknown): { abs: string; rel
     throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro file requerido (string no vacío)")
   }
   const abs = resolve(projectDir, file)
-  const rel = relative(projectDir, abs)
-  if (rel === "" || rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
+  const rel = projectKeyFor(projectDir, abs)
+  if (rel === null) {
     throw new AnchorStoreError("E_PATH_EXCLUDED", `Path fuera del proyecto: "${file}"`)
   }
-  if (escapesProjectByRealpath(projectDir, abs)) {
-    throw new AnchorStoreError("E_PATH_EXCLUDED", `Path fuera del proyecto: "${file}"`)
-  }
-  return { abs, rel: rel.split(sep).join("/") }
+  return { abs, rel }
 }
 
 // Args de copy/move (#13/#15): mismo contrato validado una sola vez.

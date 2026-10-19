@@ -234,9 +234,12 @@ export async function autoServeMentionedPaths(
   for (const ref of extractMentionedRefs(text)) {
     const tok = ref.token
     const abs = resolve(projectDir, tok)
-    if (seen.has(abs)) continue
-    seen.add(abs)
     const rel = relativeKeyFor(projectDir, abs)
+    // Dedupe por clave de proyecto: en Windows dos menciones del mismo archivo
+    // con distinto case comparten rel; fuera del proyecto la clave sigue siendo abs.
+    const seenKey = rel ?? abs
+    if (seen.has(seenKey)) continue
+    seen.add(seenKey)
     if (rel === null) {
       if (ref.explicit) {
         skipped.push({

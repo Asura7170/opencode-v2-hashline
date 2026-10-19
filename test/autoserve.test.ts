@@ -149,6 +149,26 @@ describe("autoServeMentionedPaths", () => {
     expect(proj.peek(join(dir, "sub"))).toBeNull()
     store.close()
   })
+
+  // Windows (FS case-insensitive): el dedupe por clave de proyecto sirve una
+  // sola vez el mismo archivo mencionado con distinta capitalización.
+  test.skipIf(process.platform !== "win32")(
+    "case-insensitive: dos menciones del mismo archivo se sirven una vez",
+    async () => {
+      const dir = project()
+      writeFileSync(join(dir, "MixedCase.txt"), "one\ntwo")
+      const store = memStore()
+      const proj = withProjectKeys(store, dir)
+      const { served, skipped } = await autoServeMentionedPaths(
+        "revisa MixedCase.txt y mixedcase.txt",
+        dir,
+        proj,
+      )
+      expect(skipped).toEqual([])
+      expect(served.map((s) => s.file)).toEqual(["mixedcase.txt"])
+      store.close()
+    },
+  )
 })
 
 describe("política de menciones (@ vs desnudas)", () => {

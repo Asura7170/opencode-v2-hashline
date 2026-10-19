@@ -6,6 +6,7 @@ import { join } from "node:path"
 
 import {
   DEFAULT_CONFIG,
+  foldKey,
   globalConfigPath,
   loadHashlineConfig,
   projectConfigPath,
@@ -139,6 +140,13 @@ function symlinksSupported(): boolean {
 
 const SYMLINKS = symlinksSupported()
 
+describe("foldKey: plegado de case (Windows)", () => {
+  test("foldCase pliega a minúsculas; sin fold no toca la clave", () => {
+    expect(foldKey("Dir/File.TS", true)).toBe("dir/file.ts")
+    expect(foldKey("Dir/File.TS", false)).toBe("Dir/File.TS")
+  })
+})
+
 describe("relativeKeyFor: contención de symlinks", () => {
   test("archivo dentro → clave relativa normal", () => {
     const dir = mkdtempSync(join(tmpdir(), "t9-keys-"))
@@ -153,4 +161,15 @@ describe("relativeKeyFor: contención de symlinks", () => {
     symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"))
     expect(relativeKeyFor(dir, join(dir, "link.txt"))).toBeNull()
   })
+
+  test.skipIf(!SYMLINKS || process.platform === "win32")(
+    "projectDir symlink: la clave se mide contra el real",
+    () => {
+      const real = mkdtempSync(join(tmpdir(), "t9-keys-real-"))
+      writeFileSync(join(real, "a.txt"), "x")
+      const link = join(mkdtempSync(join(tmpdir(), "t9-keys-link-")), "proj")
+      symlinkSync(real, link)
+      expect(relativeKeyFor(link, join(link, "a.txt"))).toBe("a.txt")
+    },
+  )
 })
