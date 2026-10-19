@@ -7,3 +7,4 @@ Read during review, not implementation. Judgement calls no guardrail can enforce
 - Every skip path emits its reason into the per-message summary: no silent `catch { continue }` in gate paths.
 - Gate checks run cheapest-first (excludes/oversize before quota), so the reported reason is the most relevant one.
 - Unit tests replicate the production geometry (one sidecar per session): a rule tested only under a shared-store fixture with foreign rows pre-seeded can pass while its production branch never fires.
+- Every write preserves the file's EOL and BOM (read normalizes, write serializes with the detected style); a CRLF edit must diff only the anchored lines.
