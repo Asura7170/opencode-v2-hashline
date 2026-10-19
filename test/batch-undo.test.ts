@@ -559,3 +559,23 @@ describe("t7 undo_last_change", () => {
     await second.cleanup?.()
   })
 })
+
+describe("t7 undo y EOL/BOM originales", () => {
+  test("undo tras un edit CRLF restaura EOL y BOM", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "\uFEFFa\r\nb\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const ctx = callCtx("s1", "m1")
+    const before = await anchorsOf(tools, "a.txt", ctx)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        ctx,
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("\uFEFFa\r\nB\r\n")
+    await tools.get("undo_last_change").execute({ file: "a.txt" }, ctx)
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("\uFEFFa\r\nb\r\n")
+    await cleanup?.()
+  })
+})

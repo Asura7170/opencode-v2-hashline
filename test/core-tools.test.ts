@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { mkdtempSync, writeFileSync } from "node:fs"
-import { stat } from "node:fs/promises"
+import { readFile, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -368,6 +368,65 @@ describe("t10 contrato de registro con el host (e2e 2.0.26)", () => {
     ]) {
       expect(tools.get(name)?.options).toEqual({ codemode: false })
     }
+    await cleanup?.()
+  })
+})
+
+describe("t5 EOL y BOM: solo cambian las líneas ancladas", () => {
+  test("replace en archivo CRLF conserva el CRLF del resto", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\r\nb\r\nc\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\r\nB\r\nc\r\n")
+    await cleanup?.()
+  })
+
+  test("replace conserva el BOM inicial y el CRLF", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "\uFEFFa\r\nb\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("\uFEFFa\r\nB\r\n")
+    await cleanup?.()
+  })
+
+  test("insert en archivo CRLF mantiene el CRLF", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\r\nc\r\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("insert")
+      .execute({ file: "a.txt", anchor: before[0].anchor, position: "after", content: "b" }, callCtx())
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\r\nb\r\nc\r\n")
+    await cleanup?.()
+  })
+
+  test("archivo LF sigue escribiendo LF (sin regresión)", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\nb\nc\n")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\nB\nc\n")
     await cleanup?.()
   })
 })
