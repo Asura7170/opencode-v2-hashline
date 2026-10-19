@@ -71,6 +71,14 @@ relative is resolved against the **project** directory.
   strips — it fails closed with `E_ANCHOR_ECHO`.
 - Stale anchors fail with `E_ANCHOR_STALE` plus the current rows in the
   message, so the model retries without a re-read.
+- A write re-validates the disk snapshot taken by the tool: if the file changed
+  in between, it fails closed with `E_FILE_CHANGED` (re-read and retry) instead
+  of overwriting the external change. Two-file `move` may leave a duplicate in
+  an extreme race (destination written, source intact) — never data loss.
+- Project keys are folded to lowercase on Windows and canonicalized through
+  `realpath` (internal symlinks map to their real target), so the same file
+  spelled `A.ts`/`a.ts` shares one anchor set. Pre-existing Windows sidecar
+  records with mixed case are re-served on first read.
 
 ## Tests
 
