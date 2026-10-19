@@ -1,5 +1,5 @@
-import { mkdirSync, realpathSync } from "node:fs"
-import { chmod, lstat, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { constants, mkdirSync, realpathSync } from "node:fs"
+import { chmod, copyFile, link, lstat, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path"
 
 import {
@@ -70,12 +70,22 @@ let tmpSeq = 0
 
 // Lost update: el archivo pudo cambiar en disco entre el read de la tool y la
 // escritura; expectedRaw es el contenido crudo (BOM/CRLF incluidos) de ese read.
+// null = el read lo dio por borrado: el archivo debe seguir ausente.
 async function assertUnchanged(
   abs: string,
-  expectedRaw: string | undefined,
+  expectedRaw: string | null | undefined,
   rel: string,
 ): Promise<void> {
   if (expectedRaw === undefined) return
+  if (expectedRaw === null) {
+    try {
+      await lstat(abs)
+    } catch (err) {
+      if (errorCode(err) === "ENOENT") return
+      throw err
+    }
+    throw changedOnCreate(rel)
+  }
   let current: string
   try {
     current = await readFile(abs, "utf-8")
@@ -100,12 +110,12 @@ async function assertUnchanged(
 // Symlink: escribe el target real (rename reemplazaría el enlace). Modo: el
 // inodo nuevo hereda el del destino para no perderlo (p.ej. 0o755).
 // La comprobación anti lost-update corre justo antes del rename; el temporal
-// ya escrito se borra si falla. Sin expectedRaw no hay chequeo (undo que
-// recrea un archivo borrado pasa undefined).
+// ya escrito se borra si falla. expectedRaw null = recrear un borrado: link (o
+// copyFile EXCL) sin sobrescribir una creación concurrente.
 async function writeAtomic(
   abs: string,
   content: string,
-  expectedRaw: string | undefined,
+  expectedRaw: string | null | undefined,
   rel: string,
 ): Promise<void> {
   let target = abs
@@ -124,11 +134,44 @@ async function writeAtomic(
     }
     // shortcut: la ventana check→rename no es cero sin CAS/lock.
     await assertUnchanged(abs, expectedRaw, rel)
-    await rename(tmp, target)
+    if (expectedRaw === null) {
+      try {
+        await link(tmp, target)
+      } catch (err) {
+        const code = errorCode(err)
+        if (code === "EEXIST") throw changedOnCreate(rel)
+        if (
+          code !== "EPERM" &&
+          code !== "EACCES" &&
+          code !== "ENOSYS" &&
+          code !== "ENOTSUP" &&
+          code !== "EXDEV" &&
+          code !== "EMLINK"
+        ) {
+          throw err
+        }
+        try {
+          await copyFile(tmp, target, constants.COPYFILE_EXCL)
+        } catch (copyErr) {
+          if (errorCode(copyErr) === "EEXIST") throw changedOnCreate(rel)
+          throw copyErr
+        }
+      }
+      await rm(tmp, { force: true }).catch(() => {})
+    } else {
+      await rename(tmp, target)
+    }
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => {})
     throw err
   }
+}
+
+function changedOnCreate(rel: string): AnchorStoreError {
+  return new AnchorStoreError(
+    "E_FILE_CHANGED",
+    `Cambió en disco desde el read: "${rel}" apareció (ya existe); vuelve a leerlo y reintenta`,
+  )
 }
 
 function resolveInProject(projectDir: string, file: unknown): { abs: string; rel: string } {
@@ -1017,17 +1060,20 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       else throw err
     }
     const store = storeFor(context.sessionID)
+    const beforeRestore = store.peek(rel)
     const restored = store.restoreShadow(rel, diskLines)
     const restoredLines = restored.rows.map((r) => r.content)
     try {
-      await writeAtomic(abs, serialize(restoredLines, diskMeta), diskRaw, rel)
+      // shortcut: al recrear se pierde el EOL/BOM original (la sombra solo guarda contenido).
+      await writeAtomic(abs, serialize(restoredLines, diskMeta), diskLines === null ? null : diskRaw, rel)
     } catch (err) {
       // restoreShadow ya consumió la sombra; si la escritura falla, commit
-      // devuelve el estado pre-undo y la sombra disponible. Archivo borrado
-      // (diskLines null): sin estado en disco que restaurar, solo se relanza.
-      if (diskLines !== null) {
+      // devuelve el estado pre-undo y la sombra disponible.
+      const rollbackContent =
+        diskLines !== null ? diskLines.join("\n") : beforeRestore?.map((r) => r.content).join("\n")
+      if (rollbackContent !== undefined) {
         try {
-          store.commit(rel, diskLines.join("\n"))
+          store.commit(rel, rollbackContent)
         } catch {}
       }
       throw err

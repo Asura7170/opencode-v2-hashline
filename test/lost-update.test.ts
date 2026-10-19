@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -293,6 +293,33 @@ describe("lost update: el archivo cambia entre el read y la escritura", () => {
     expect(await readFile(abs, "utf-8")).toBe("externo\n")
     // Rollback: la sombra consumida por restoreShadow vuelve a estar disponible.
     expect(real.undoShadow("a.txt")).toEqual(["one", "two", "three"])
+    // Segundo intento: falla por stale (el disco ya no coincide), no por vacío.
+    await expect(tools.get("undo_last_change").execute({ file: "a.txt" }, ctx)).rejects.toThrow(
+      /E_ANCHOR_STALE/,
+    )
+    await done()
+  })
+
+  test("undo de archivo borrado: creación concurrente aborta y re-arma la sombra", async () => {
+    const dir = project()
+    const abs = join(dir, "a.txt")
+    writeFileSync(abs, "one\ntwo")
+    const { tools, armRestore, real, done } = await setup(dir)
+    const ctx = callCtx()
+    const rows = await rowsOf(tools, "a.txt", ctx)
+    await tools.get("replace").execute(
+      { file: "a.txt", startAnchor: rows[0].anchor, endAnchor: rows[0].anchor, content: "editado" },
+      ctx,
+    )
+    rmSync(abs)
+    // El archivo reaparece entre el read del undo (ENOENT) y la escritura.
+    armRestore("a.txt", () => writeFileSync(abs, "externo\n"))
+    await expect(tools.get("undo_last_change").execute({ file: "a.txt" }, ctx)).rejects.toThrow(
+      /E_FILE_CHANGED/,
+    )
+    expect(await readFile(abs, "utf-8")).toBe("externo\n")
+    // Rollback: la sombra consumida por restoreShadow vuelve a estar disponible.
+    expect(real.undoShadow("a.txt")).toEqual(["one", "two"])
     // Segundo intento: falla por stale (el disco ya no coincide), no por vacío.
     await expect(tools.get("undo_last_change").execute({ file: "a.txt" }, ctx)).rejects.toThrow(
       /E_ANCHOR_STALE/,

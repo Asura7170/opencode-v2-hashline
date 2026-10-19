@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -450,19 +450,20 @@ describe("t7 undo_last_change", () => {
 
   test("recrea el archivo si fue borrado tras el edit", async () => {
     const dir = project()
-    writeFileSync(join(dir, "a.txt"), "a\nb")
+    writeFileSync(join(dir, "a.txt"), "one\ntwo")
     const { tools, cleanup } = await setup(dir)
     const ctx = callCtx("s1", "m1")
     const before = await anchorsOf(tools, "a.txt", ctx)
     await tools
       .get("replace")
       .execute(
-        { file: "a.txt", startAnchor: before[0].anchor, endAnchor: before[0].anchor, content: "A" },
+        { file: "a.txt", startAnchor: before[0].anchor, endAnchor: before[0].anchor, content: "editado" },
         ctx,
       )
     rmSync(join(dir, "a.txt"))
     await tools.get("undo_last_change").execute({ file: "a.txt" }, ctx)
-    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\nb")
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("one\ntwo")
+    expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([])
     await cleanup?.()
   })
 
