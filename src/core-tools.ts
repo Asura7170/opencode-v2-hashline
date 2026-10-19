@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs"
-import { readFile, writeFile } from "node:fs/promises"
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path"
+import { mkdirSync, realpathSync } from "node:fs"
+import { chmod, lstat, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 
 import {
   AnchorStoreError,
@@ -17,6 +17,7 @@ import {
 
 import {
   DEFAULT_CONFIG,
+  escapesProjectByRealpath,
   loadHashlineConfig,
   storePathFor as configStorePathFor,
   type HashlineConfig,
@@ -65,6 +66,33 @@ function splitLines(content: string): string[] {
   return content.replace(/\r\n/g, "\n").split("\n")
 }
 
+let tmpSeq = 0
+
+// Escritura atómica: temporal en el mismo directorio + rename (mismo filesystem).
+// Symlink: escribe el target real (rename reemplazaría el enlace). Modo: el
+// inodo nuevo hereda el del destino para no perderlo (p.ej. 0o755).
+async function writeAtomic(abs: string, content: string): Promise<void> {
+  let target = abs
+  try {
+    if ((await lstat(abs)).isSymbolicLink()) target = realpathSync(abs)
+  } catch (err) {
+    if (errorCode(err) !== "ENOENT") throw err
+  }
+  const tmp = join(dirname(target), `.${basename(target)}.${process.pid}.${++tmpSeq}.tmp`)
+  try {
+    await writeFile(tmp, content, "utf-8")
+    try {
+      await chmod(tmp, (await stat(target)).mode)
+    } catch (err) {
+      if (errorCode(err) !== "ENOENT") throw err
+    }
+    await rename(tmp, target)
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
+}
+
 function resolveInProject(projectDir: string, file: unknown): { abs: string; rel: string } {
   if (typeof file !== "string" || file.length === 0) {
     throw new AnchorStoreError("E_INVALID_INPUT", "Parámetro file requerido (string no vacío)")
@@ -72,6 +100,9 @@ function resolveInProject(projectDir: string, file: unknown): { abs: string; rel
   const abs = resolve(projectDir, file)
   const rel = relative(projectDir, abs)
   if (rel === "" || rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
+    throw new AnchorStoreError("E_PATH_EXCLUDED", `Path fuera del proyecto: "${file}"`)
+  }
+  if (escapesProjectByRealpath(projectDir, abs)) {
     throw new AnchorStoreError("E_PATH_EXCLUDED", `Path fuera del proyecto: "${file}"`)
   }
   return { abs, rel: rel.split(sep).join("/") }
@@ -411,7 +442,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batch, rel, async () => {
       checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeFile(abs, finalContent, "utf-8"))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent))
     const committed = await tracked(batch, rel, () =>
       // Continuación de batch: un solo undo por mensaje (sombra del primero).
       Promise.resolve(
@@ -507,7 +538,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batch, rel, async () => {
       checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeFile(abs, finalContent, "utf-8"))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent))
     const committed = await tracked(batch, rel, () =>
       // Continuación de batch: un solo undo por mensaje (sombra del primero).
       Promise.resolve(
@@ -589,7 +620,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batch, rel, async () => {
       checkNewContent(rel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batch, rel, () => writeFile(abs, finalContent, "utf-8"))
+    await tracked(batch, rel, () => writeAtomic(abs, finalContent))
     const committed = await tracked(batch, rel, () =>
       Promise.resolve(
         batch && batch.commits > 0
@@ -688,7 +719,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     await tracked(batchDst, dstRel, async () => {
       checkNewContent(dstRel, finalContent, cfg.maxFileBytes)
     })
-    await tracked(batchDst, dstRel, () => writeFile(dstAbs, finalContent, "utf-8"))
+    await tracked(batchDst, dstRel, () => writeAtomic(dstAbs, finalContent))
     const committed = await tracked(batchDst, dstRel, () =>
       Promise.resolve(
         batchDst && batchDst.commits > 0
@@ -836,7 +867,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       await tracked(batchSrc, srcRel, async () => {
         checkNewContent(srcRel, finalContent, cfg.maxFileBytes)
       })
-      await tracked(batchSrc, srcRel, () => writeFile(srcAbs, finalContent, "utf-8"))
+      await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalContent))
       const committed = await tracked(batchSrc, srcRel, () =>
         Promise.resolve(
           batchSrc && batchSrc.commits > 0
@@ -883,7 +914,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
       ...splitLines(srcDisk.text).slice(srcRange.endLine),
     ].join("\n")
     const finalEmptied = serialize(splitLines(emptied), srcDisk)
-    await tracked(batchSrc, srcRel, () => writeFile(srcAbs, finalEmptied, "utf-8"))
+    await tracked(batchSrc, srcRel, () => writeAtomic(srcAbs, finalEmptied))
     const srcCommitted = await tracked(batchSrc, srcRel, () =>
       Promise.resolve(
         batchSrc && batchSrc.commits > 0
@@ -943,7 +974,7 @@ export async function registerCoreTools(ctx: CoreToolsHost, deps?: CoreToolsDeps
     const store = storeFor(context.sessionID)
     const restored = store.restoreShadow(rel, diskLines)
     const restoredLines = restored.rows.map((r) => r.content)
-    await writeFile(abs, serialize(restoredLines, diskMeta), "utf-8")
+    await writeAtomic(abs, serialize(restoredLines, diskMeta))
     // El undo cierra los batches abiertos de este archivo: el próximo edit
     // abre un nivel de undo fresco.
     const sessionID = context?.sessionID

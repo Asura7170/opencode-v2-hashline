@@ -1,3 +1,4 @@
+import { existsSync, realpathSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -164,6 +165,20 @@ export async function loadHashlineConfig(load: LoadOptions = {}): Promise<Hashli
   return resolveConfig(layers)
 }
 
+// Un symlink/junction dentro del proyecto puede apuntar fuera: realpath manda.
+// No existente o ENOENT → sin veredicto (el read posterior da E_FILE_NOT_FOUND).
+export function escapesProjectByRealpath(projectDir: string, abs: string): boolean {
+  if (!existsSync(abs)) return false
+  let realRel: string
+  try {
+    realRel = relative(realpathSync(projectDir), realpathSync(abs))
+  } catch (err) {
+    if (errorCode(err) === "ENOENT") return false
+    throw err
+  }
+  return realRel === "" || realRel === ".." || realRel.startsWith(`..${sep}`) || isAbsolute(realRel)
+}
+
 // Unificación de claves (divergencia #5/#8): la admisión recibe paths absolutos
 // (uris) y los tools claves relativas al proyecto; ambos deben caer al mismo
 // served-record. Dentro del proyecto → relativa con "/" (como los tools);
@@ -172,6 +187,7 @@ export function relativeKeyFor(projectDir: string, fsPath: string): string | nul
   const abs = isAbsolute(fsPath) ? fsPath : resolve(projectDir, fsPath)
   const rel = relative(projectDir, abs)
   if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null
+  if (escapesProjectByRealpath(projectDir, abs)) return null
   return rel.split(sep).join("/")
 }
 

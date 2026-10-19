@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -9,6 +9,7 @@ import {
   globalConfigPath,
   loadHashlineConfig,
   projectConfigPath,
+  relativeKeyFor,
   resolveConfig,
   storePathFor,
 } from "../src/config"
@@ -121,5 +122,35 @@ describe("config precedencia y sanitize", () => {
     await expect(
       loadHashlineConfig({ projectDir: dir, projectPath, globalPath: join(dir, "ng.json") }),
     ).rejects.toThrow(/E_INVALID_CONFIG/)
+  })
+})
+
+// Windows sin developer mode: symlinkSync da EPERM/EACCES → se salta el caso.
+function symlinksSupported(): boolean {
+  const dir = mkdtempSync(join(tmpdir(), "t9-link-probe-"))
+  try {
+    writeFileSync(join(dir, "target"), "x")
+    symlinkSync(join(dir, "target"), join(dir, "link"))
+    return true
+  } catch {
+    return false
+  }
+}
+
+const SYMLINKS = symlinksSupported()
+
+describe("relativeKeyFor: contención de symlinks", () => {
+  test("archivo dentro → clave relativa normal", () => {
+    const dir = mkdtempSync(join(tmpdir(), "t9-keys-"))
+    writeFileSync(join(dir, "a.txt"), "x")
+    expect(relativeKeyFor(dir, join(dir, "a.txt"))).toBe("a.txt")
+  })
+
+  test.skipIf(!SYMLINKS)("symlink que escapa → null", () => {
+    const outside = mkdtempSync(join(tmpdir(), "t9-keys-out-"))
+    writeFileSync(join(outside, "secret.txt"), "x")
+    const dir = mkdtempSync(join(tmpdir(), "t9-keys-"))
+    symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"))
+    expect(relativeKeyFor(dir, join(dir, "link.txt"))).toBeNull()
   })
 })

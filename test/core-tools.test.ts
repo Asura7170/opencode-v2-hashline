@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from "node:fs"
 import { readFile, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -12,6 +12,20 @@ const ROW_RE = /^[a-z]{4}│/
 function project() {
   return mkdtempSync(join(tmpdir(), "t5-"))
 }
+
+// Windows sin developer mode: symlinkSync da EPERM/EACCES → se salta el caso.
+function symlinksSupported(): boolean {
+  const dir = mkdtempSync(join(tmpdir(), "t5-link-probe-"))
+  try {
+    writeFileSync(join(dir, "target"), "x")
+    symlinkSync(join(dir, "target"), join(dir, "link"))
+    return true
+  } catch {
+    return false
+  }
+}
+
+const SYMLINKS = symlinksSupported()
 
 function makeCtx(projectDir: string) {
   const tools = new Map<string, any>()
@@ -150,6 +164,18 @@ describe("t5 read (override nativo)", () => {
     ).rejects.toThrow(/E_FILE_NOT_FOUND/)
     await cleanup?.()
   })
+
+  test.skipIf(!SYMLINKS)("symlink que escapa del proyecto → E_PATH_EXCLUDED", async () => {
+    const outside = project()
+    writeFileSync(join(outside, "secret.txt"), "secret")
+    const dir = project()
+    symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"))
+    const { tools, cleanup } = await setup(dir)
+    await expect(
+      tools.get("read").execute({ file: "link.txt" }, callCtx()),
+    ).rejects.toThrow(/E_PATH_EXCLUDED/)
+    await cleanup?.()
+  })
 })
 
 describe("t5 replace por anchor", () => {
@@ -232,6 +258,57 @@ describe("t5 replace por anchor", () => {
     expect(m2).toBe(m1)
     const after = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
     expect(after.map((r) => r.anchor)).toEqual(before.map((r) => r.anchor))
+    await cleanup?.()
+  })
+
+  test("escritura atómica: replace no deja temporales", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "a.txt"), "a\nb\nc")
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "a.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "a.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "a.txt"), "utf-8")).toBe("a\nB\nc")
+    expect(readdirSync(dir).filter((n) => n.endsWith(".tmp"))).toEqual([])
+    await cleanup?.()
+  })
+
+  // Windows: chmod solo toca el bit de escritura; el modo POSIX no es fiable.
+  test.skipIf(process.platform === "win32")("escritura atómica conserva el modo 0o755", async () => {
+    const dir = project()
+    const file = join(dir, "run.sh")
+    writeFileSync(file, "#!/bin/sh\necho a\n")
+    chmodSync(file, 0o755)
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "run.sh" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "run.sh", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "echo b" },
+        callCtx(),
+      )
+    expect((await stat(file)).mode & 0o777).toBe(0o755)
+    await cleanup?.()
+  })
+
+  test.skipIf(!SYMLINKS)("editar vía symlink interno conserva el enlace y escribe el target", async () => {
+    const dir = project()
+    writeFileSync(join(dir, "target.txt"), "a\nb\nc")
+    symlinkSync(join(dir, "target.txt"), join(dir, "link.txt"))
+    const { tools, cleanup } = await setup(dir)
+    const before = rowsOf((await tools.get("read").execute({ file: "link.txt" }, callCtx())).content)
+    await tools
+      .get("replace")
+      .execute(
+        { file: "link.txt", startAnchor: before[1].anchor, endAnchor: before[1].anchor, content: "B" },
+        callCtx(),
+      )
+    expect(await readFile(join(dir, "target.txt"), "utf-8")).toBe("a\nB\nc")
+    expect(lstatSync(join(dir, "link.txt")).isSymbolicLink()).toBe(true)
     await cleanup?.()
   })
 })
