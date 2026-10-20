@@ -1,4 +1,4 @@
-# opencode-hashline
+# opencode-v2-hashline
 
 Hashline plugin for opencode v2 (pi-style allocated anchors).
 
@@ -11,28 +11,43 @@ served-record inheritance across files or sessions). Native `edit` inputs get ec
 `E_ANCHOR_ECHO`. `@file` attachments arrive annotated and in-project files
 are editable by anchor without a prior read.
 
-## Local install
+## Install from npm
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-v2-hashline"]
+}
+```
+
+OpenCode v2 installs the missing package when the plugin loads; `opencode plugin list`
+confirms it (internal id stays `opencode-hashline`). Update future versions with
+`opencode plugin update`. This is a Bun/OpenCode v2 plugin and does not run on plain Node.
+
+If you previously loaded this plugin from a local path or the older `opencode-hashline` package, remove that entry first so it is not loaded twice.
+
+## Local development
 
 Prerequisites: [opencode v2](https://opencode.ai/v2/docs) (`opencode --version`
-≥ 2.0) and [bun](https://bun.sh) 1.x.
+≥ 2.0) and [bun](https://bun.sh) `>= 1.4.2`.
 
 Install dependencies **inside the plugin directory** (the host loads the
 directory as-is; without its own `node_modules` it fails to resolve
 `@opencode/plugin`):
 
 ```sh
-cd /absolute/path/to/opencode-hashline
+cd /absolute/path/to/opencode-v2-hashline
 bun install
 ```
 
 Register this directory as a local plugin in your project's `opencode.jsonc`
-(absolute path; the entry **must be a directory** — opencode resolves it via
-`package.json` `main`):
+(absolute path; the entry **must be a directory** — the v2 directory loader
+uses the root `index.ts`; `main`/`exports` serve npm imports):
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["/absolute/path/to/opencode-hashline"],
+  "plugins": ["/absolute/path/to/opencode-v2-hashline"],
 }
 ```
 
