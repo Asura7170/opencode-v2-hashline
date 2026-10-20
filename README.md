@@ -24,7 +24,7 @@ OpenCode v2 installs the missing package when the plugin loads; `opencode plugin
 confirms it (internal id stays `opencode-hashline`). Update future versions with
 `opencode plugin update`. This is a Bun/OpenCode v2 plugin and does not run on plain Node.
 
-If you previously loaded this plugin from a local path or the older `opencode-hashline` package, remove that entry first so it is not loaded twice.
+If you previously loaded this plugin from a local path, or you have the unrelated `opencode-hashline` package (different author and implementation) installed, remove that entry first so two hashline plugins are not loaded.
 
 ## Local development
 
