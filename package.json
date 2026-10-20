@@ -1,19 +1,36 @@
 {
-  "name": "opencode-hashline",
+  "name": "opencode-v2-hashline",
   "version": "0.1.0",
+  "description": "Hashline anchor editing plugin for OpenCode v2 (Bun).",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
     "./plugin": "./src/index.ts"
   },
+  "files": ["index.ts", "src", "README.md", "LICENSE"],
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "oxlint src"
+    "lint": "oxlint src",
+    "prepublishOnly": "bun test && bun run typecheck && bun run lint"
+  },
+  "keywords": ["opencode", "opencode-plugin", "hashline", "anchors", "ai", "coding-agent"],
+  "author": "Asura7170",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Asura7170/opencode-v2-hashline.git"
+  },
+  "homepage": "https://github.com/Asura7170/opencode-v2-hashline#readme",
+  "bugs": {
+    "url": "https://github.com/Asura7170/opencode-v2-hashline/issues"
+  },
+  "engines": {
+    "bun": ">=1.4.2"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.26"
+    "@opencode/plugin": "^2.0.32"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
